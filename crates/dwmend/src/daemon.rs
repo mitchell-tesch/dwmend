@@ -216,6 +216,13 @@ pub fn run_daemon() -> Result<()> {
     }
     let _ = wm.retile_all();
     recovery::save(&wm)?;
+    // Cache of the last sorted id-list we wrote to `hwnds.json`. Used by
+    // the periodic save in the select! loop to skip redundant disk writes
+    // when the managed-window set hasn't changed since the previous tick
+    // — important when `%LOCALAPPDATA%` is on a network home / OneDrive
+    // path where atomic-rename can stall arbitrarily.
+    let mut last_saved_ids: Vec<isize> = wm.windows.keys().map(|w| w.0).collect();
+    last_saved_ids.sort_unstable();
 
     let wm = Arc::new(Mutex::new(wm));
 
@@ -411,11 +418,19 @@ pub fn run_daemon() -> Result<()> {
             // (potentially slow) disk write does not block events / hotkeys.
             // The atomic-rename in `save_ids` can stall arbitrarily on
             // OneDrive sync, antivirus scan, or a network home directory.
-            let ids: Vec<isize> = {
+            //
+            // Skip the write entirely when the managed-window set is
+            // identical to the last saved snapshot. The vec compare runs in
+            // a few microseconds for typical desktops (<100 windows); the
+            // disk path it gates is orders of magnitude more expensive.
+            let mut ids: Vec<isize> = {
                 let g = wm.lock();
                 g.windows.keys().map(|w| w.0).collect()
             };
-            let _ = recovery::save_ids(&ids);
+            ids.sort_unstable();
+            if ids != last_saved_ids && recovery::save_ids(&ids).is_ok() {
+                last_saved_ids = ids;
+            }
             last_save = std::time::Instant::now();
         }
     }

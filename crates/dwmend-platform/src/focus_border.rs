@@ -55,6 +55,28 @@ static RADIUS: AtomicI32 = AtomicI32::new(DEFAULT_RADIUS);
 static LISTENER_TID: AtomicIsize = AtomicIsize::new(0);
 static VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// Cached geometry of the most recently installed `SetWindowRgn` ring.
+// Initialised to -1 so the first `place_overlay` call always rebuilds.
+//
+// Region rebuild is the dominant cost of a focus shift: 3 \u00d7 HRGN
+// allocation + `CombineRgn(RGN_DIFF)` + `SetWindowRgn` (which itself
+// invalidates and forces a repaint). When the user simply moves focus
+// between two same-sized tiles \u2014 the most common case \u2014 the dimensions
+// match and the previously-installed region is still correct, so all of
+// that work is redundant. `SetWindowPos` already moves the window AND
+// the region together (regions are window-relative), so a pure
+// translate just needs the `SetWindowPos` on the parent function.
+//
+// The four atomics together form a single-slot cache key. We accept a
+// rare double-rebuild on a TOCTOU race rather than serialising callers
+// behind a Mutex \u2014 `place_overlay` runs on the main thread today, but
+// even if a future feature called it concurrently the worst case is one
+// extra rebuild, never an incorrect region.
+static LAST_RGN_OUTER_W: AtomicI32 = AtomicI32::new(-1);
+static LAST_RGN_OUTER_H: AtomicI32 = AtomicI32::new(-1);
+static LAST_RGN_RING_W: AtomicI32 = AtomicI32::new(-1);
+static LAST_RGN_RADIUS: AtomicI32 = AtomicI32::new(-1);
+
 // ---- public API ------------------------------------------------------------
 
 /// Spawn the border subsystem. `width` is the frame thickness in pixels,
@@ -283,6 +305,12 @@ unsafe extern "system" fn wnd_proc(
 /// inner corner radius `inner_r`. The outer radius is `inner_r + w` so the
 /// inner and outer curves are concentric and the frame thickness is uniform
 /// around the corner.
+///
+/// The region rebuild step is skipped when `(outer_w, outer_h, w, inner_r)`
+/// match the most recently installed region \u2014 i.e. the user moved focus
+/// between two tiles of identical dimensions. Regions are window-relative,
+/// so `SetWindowPos` carries the existing region with the window for free
+/// in that case.
 fn place_overlay(hwnd: HWND, target: Rect, w: i32, inner_r: i32) {
     let outer_x = target.x - w;
     let outer_y = target.y - w;
@@ -305,10 +333,26 @@ fn place_overlay(hwnd: HWND, target: Rect, w: i32, inner_r: i32) {
         )
     };
 
-    // 2. Build the ring region.
+    // 2. Cache check: skip region rebuild when geometry is unchanged.
+    //    Each `swap` returns the previous value; an all-match outcome
+    //    means the currently-installed region is still correct for this
+    //    target rect and we can return without any GDI region work.
+    let prev_outer_w = LAST_RGN_OUTER_W.swap(outer_w, Ordering::Relaxed);
+    let prev_outer_h = LAST_RGN_OUTER_H.swap(outer_h, Ordering::Relaxed);
+    let prev_ring_w = LAST_RGN_RING_W.swap(w, Ordering::Relaxed);
+    let prev_radius = LAST_RGN_RADIUS.swap(inner_r, Ordering::Relaxed);
+    if prev_outer_w == outer_w
+        && prev_outer_h == outer_h
+        && prev_ring_w == w
+        && prev_radius == inner_r
+    {
+        return;
+    }
+
+    // 3. Build the ring region.
     //    SetWindowRgn coordinates are window-relative (top-left = 0,0).
     //    `CreateRoundRectRgn(x1,y1,x2,y2,wEllipse,hEllipse)`:
-    //      - The rect is [x1, y1, x2, y2) — x2/y2 are exclusive.
+    //      - The rect is [x1, y1, x2, y2) \u2014 x2/y2 are exclusive.
     //      - wEllipse / hEllipse are the *diameters* of the corner ellipse,
     //        i.e. 2 * radius.
     let outer_r = (inner_r + w).max(0);
@@ -326,7 +370,7 @@ fn place_overlay(hwnd: HWND, target: Rect, w: i32, inner_r: i32) {
     // SAFETY: HRGN is a HGDIOBJ subtype; DeleteObject accepts a null HRGN.
     let _ = unsafe { DeleteObject(HGDIOBJ(outer_rgn.0)) };
     let _ = unsafe { DeleteObject(HGDIOBJ(inner_rgn.0)) };
-    // 3. Hand `ring` to the OS — it owns the HRGN now and frees the old one.
+    // 4. Hand `ring` to the OS \u2014 it owns the HRGN now and frees the old one.
     // SAFETY: HWND from our own CreateWindow; ring is valid; bredraw=TRUE.
     let _ = unsafe { SetWindowRgn(hwnd, Some(ring), true) };
 }

@@ -200,7 +200,14 @@ unsafe extern "system" fn hook_callback(
         EVENT_SYSTEM_MOVESIZEEND => WinEvent::MoveSizeEnd(hwnd_isize),
         EVENT_SYSTEM_MINIMIZESTART => WinEvent::Minimized(hwnd_isize),
         EVENT_SYSTEM_MINIMIZEEND => WinEvent::Restored(hwnd_isize),
-        EVENT_OBJECT_LOCATIONCHANGE => WinEvent::LocationChanged(hwnd_isize),
+        // EVENT_OBJECT_LOCATIONCHANGE is dropped at the source: it fires
+        // tens-to-hundreds of times per second during mouse hovers, animations,
+        // and caret blinks, the daemon has no actionable response for it,
+        // and forwarding it would still cost a channel hop + WM mutex acquire
+        // per event. The `WinEvent::LocationChanged` variant is retained for
+        // forward-compatibility (e.g. a future drag-to-tile feature would
+        // re-enable this arm with a managed-HWND filter).
+        EVENT_OBJECT_LOCATIONCHANGE => return,
         EVENT_OBJECT_NAMECHANGE => WinEvent::NameChanged(hwnd_isize),
         _ => return, // ignore everything else
     };

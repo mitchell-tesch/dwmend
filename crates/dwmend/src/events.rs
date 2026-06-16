@@ -132,9 +132,13 @@ pub fn handle(wm: &mut WindowManager, rules: &[Rule], event: WinEvent) -> bool {
             false
         }
         WinEvent::LocationChanged(_h) => {
-            // Noisy event (mouse hovers, animations, caret blink) — fires
-            // tens to hundreds of times per second. Nothing actionable and
-            // no bar state changes.
+            // The platform crate's `winevent` callback now drops
+            // `EVENT_OBJECT_LOCATIONCHANGE` before it reaches the channel
+            // (see comment there for why). This arm is retained as a
+            // defensive no-op so a future feature that re-enables the
+            // event source — e.g. drag-to-tile — doesn't accidentally
+            // trigger a `wm.lock()` per pixel of mouse motion. Bar
+            // state is unchanged.
             false
         }
         WinEvent::NameChanged(h) => {

@@ -38,7 +38,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -164,6 +164,12 @@ struct BarHandle {
     /// HWND as `isize` so it's Send.
     hwnd: isize,
     snapshot: Arc<Mutex<BarSnapshot>>,
+    /// `wMinute` of the last `WM_TIMER`-driven invalidate, or `-1` before
+    /// the first tick. Used to skip the per-second `InvalidateRect` when
+    /// the displayed clock minute hasn't actually changed — a 12-hour
+    /// `H:MM AM/PM` clock only needs one repaint per minute, not 60.
+    /// `WM_WTM_BAR_REFRESH` (event-driven repaints) bypasses this gate.
+    last_painted_minute: AtomicI32,
 }
 
 static BARS: OnceLock<Mutex<BarMap>> = OnceLock::new();
@@ -587,6 +593,7 @@ fn create_bar_hwnd(
         BarHandle {
             hwnd: hwnd.0 as isize,
             snapshot,
+            last_painted_minute: AtomicI32::new(-1),
         },
     );
     // SAFETY: HWND from our own CreateWindow.
@@ -682,10 +689,34 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_TIMER => {
             // 1 Hz clock tick (TIMER_ID_CLOCK is the only timer on this window).
-            // Same reasoning as WM_WTM_BAR_REFRESH — no OS-side erase.
-            // SAFETY: HWND from our own CreateWindow.
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
+            // Skip the invalidate when the displayed minute hasn't changed:
+            // the bar's clock format is `H:MM AM/PM`, so the visible pixels
+            // only differ once per minute. Without this guard each timer
+            // tick triggered a full bar repaint (~60× more GDI work than
+            // necessary, multiplied by every connected monitor).
+            //
+            // `WM_WTM_BAR_REFRESH` is the event-driven path and is left
+            // unconditional so live state changes (workspace switch, focus
+            // move, pause toggle) still repaint immediately.
+            // SAFETY: GetLocalTime takes no inputs and always succeeds.
+            let minute = unsafe { GetLocalTime() }.wMinute as i32;
+            let needs_paint = if let Some(bars) = BARS.get() {
+                let bars = bars.lock();
+                bars.values()
+                    .find(|h| h.hwnd == hwnd.0 as isize)
+                    .map(|h| h.last_painted_minute.swap(minute, Ordering::Relaxed) != minute)
+                    // Unknown bar HWND — should never happen while a
+                    // timer is firing on it, but be conservative and
+                    // invalidate so the user never sees a stuck clock.
+                    .unwrap_or(true)
+            } else {
+                true
+            };
+            if needs_paint {
+                // SAFETY: HWND from our own CreateWindow.
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
             }
             LRESULT(0)
         }
