@@ -18,8 +18,8 @@ fn main() {
     // .rc reference is unambiguous regardless of where cargo is invoked
     // from. Forward slashes work in rc.exe path strings and avoid the
     // C-escape gymnastics that backslashes would require.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR is always set by cargo");
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set by cargo");
     let icon_path = std::path::Path::new(&manifest_dir)
         .join("..")
         .join("..")

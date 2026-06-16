@@ -59,7 +59,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DI_NORMAL, DispatchMessageW, DrawIconEx,
+    CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx,
     GetMessageW, HICON, HWND_TOPMOST, IDC_ARROW, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
     LoadCursorW, LoadImageW, MSG, PostMessageW, PostThreadMessageW, RegisterClassExW,
     SET_WINDOW_POS_FLAGS, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetTimer,
