@@ -100,13 +100,20 @@ pub fn run_daemon() -> Result<()> {
     }
     let cfg = config::Config::load(&config_path)?;
     let mut rules = cfg.compile_rules()?;
+    // Bar height is captured here and reused for the lifetime of the
+    // daemon. Hot-reloading the height would require resizing every bar
+    // HWND AND recomposing every workspace's gaps reservation, which we
+    // defer to a daemon restart with a warning (see the reload arm).
     let bar_height = if cfg.general.bar_enabled {
-        ui::bar::DEFAULT_HEIGHT
+        cfg.bar.height.max(16)
     } else {
         0
     };
+    let original_bar_height = bar_height;
     let gaps = compose_gaps(&cfg, bar_height);
     let border_color = parse_focus_color(&cfg);
+    let bar_colors = parse_bar_colors(&cfg.bar);
+    let bar_segments = bar_segments_from_cfg(&cfg.bar);
 
     // ---- platform listeners ----------------------------------------------
     let winevent_rx = dwmend_platform::winevent::start()?;
@@ -131,10 +138,12 @@ pub fn run_daemon() -> Result<()> {
 
     // ---- hotkey setup ----------------------------------------------------
     // Snapshot the configured keybindings now so we can detect changes on
-    // reload (RegisterHotKey can't be re-registered without restarting the
-    // listener thread, so we just log a "restart required" warning later).
-    let original_keybindings = cfg.keybindings.clone();
-    let (router, parse_errors) = hotkey::HotkeyRouter::build(&cfg.keybindings);
+    // reload. Both `router` and `original_keybindings` need `mut` because
+    // a successful `keyboard::restart` swaps in a new router and the
+    // tracked baseline (so subsequent reloads compare against the actual
+    // active set, not the startup snapshot).
+    let mut original_keybindings = cfg.keybindings.clone();
+    let (mut router, parse_errors) = hotkey::HotkeyRouter::build(&cfg.keybindings);
     for err in &parse_errors {
         tracing::warn!(%err, "ignored malformed binding");
     }
@@ -142,6 +151,10 @@ pub fn run_daemon() -> Result<()> {
 
     // ---- command channel & watcher --------------------------------------
     let (cmd_tx, cmd_rx): (Sender<Command>, Receiver<Command>) = unbounded();
+    // Publish the sender to the bar so pill clicks can switch workspaces.
+    // Done before bar startup so the very first click after the bar is
+    // shown is dispatched correctly.
+    ui::bar::set_command_tx(cmd_tx.clone());
     reaper::start(cmd_tx.clone(), Duration::from_secs(5));
     let _watcher = watcher::start(&config_path, cmd_tx.clone())?;
     {
@@ -169,8 +182,10 @@ pub fn run_daemon() -> Result<()> {
                 bounds: m.bounds,
             })
             .collect();
-        if let Err(e) = ui::bar::start(specs, bar_height, ui::bar::BarColors::default()) {
+        if let Err(e) = ui::bar::start(specs, bar_height, bar_colors) {
             tracing::warn!(error = %e, "status bar init failed; continuing without bar");
+        } else {
+            ui::bar::set_segments(bar_segments);
         }
     }
 
@@ -207,6 +222,10 @@ pub fn run_daemon() -> Result<()> {
         gaps,
         cfg.general.on_workspace_already_visible.into(),
     )?;
+    // Apply the configured layout to every workspace before the initial
+    // top-level scan so admitted windows split using the right mode from
+    // their very first insert.
+    wm.apply_layout_mode_all(map_layout(cfg.general.layout));
 
     // Initial top-level scan.
     for win in dwmend_platform::enumerate::enumerate_top_level()? {
@@ -357,15 +376,50 @@ pub fn run_daemon() -> Result<()> {
                         match config::Config::load(&config_path) {
                             Ok(new_cfg) => match new_cfg.compile_rules() {
                                 Ok(new_rules) => {
-                                    // NOTE: hotkey bindings cannot be hot-
-                                    // reloaded with `RegisterHotKey` — the
-                                    // listener thread would have to be torn
-                                    // down and respawned. For v1 we apply
-                                    // gap/rule changes immediately and tell
-                                    // the user that key changes need a restart.
+                                    // Hot-reload `[keybindings]` by tearing
+                                    // down the listener and respawning it
+                                    // with a fresh hotkey table. The
+                                    // EVENT_TX channel survives the
+                                    // restart, so `key_rx` keeps working.
                                     if new_cfg.keybindings != original_keybindings {
+                                        let (new_router, parse_errors) =
+                                            hotkey::HotkeyRouter::build(&new_cfg.keybindings);
+                                        for err in &parse_errors {
+                                            tracing::warn!(%err,
+                                                "ignored malformed binding in reloaded config");
+                                        }
+                                        match dwmend_platform::keyboard::restart(
+                                            new_router.table.clone(),
+                                        ) {
+                                            Ok(()) => {
+                                                router = new_router;
+                                                original_keybindings = new_cfg.keybindings.clone();
+                                                tracing::info!(
+                                                    count = router.id_to_command.len(),
+                                                    "keybindings hot-reloaded"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(error = %e,
+                                                    "keybinding hot-reload failed; \
+                                                     old bindings still active");
+                                            }
+                                        }
+                                    }
+                                    // Bar height is baked into the gap
+                                    // composer at startup; resizing every
+                                    // bar HWND on the fly is a future
+                                    // enhancement. Warn so config edits
+                                    // don't silently no-op.
+                                    let new_bar_h = if new_cfg.general.bar_enabled {
+                                        new_cfg.bar.height.max(16)
+                                    } else {
+                                        0
+                                    };
+                                    if new_bar_h != original_bar_height {
                                         tracing::warn!(
-                                            "keybinding changes detected; restart dwmend to apply them"
+                                            old = original_bar_height, new = new_bar_h,
+                                            "bar height change detected; restart dwmend to apply"
                                         );
                                     }
                                     rules = new_rules;
@@ -375,9 +429,19 @@ pub fn run_daemon() -> Result<()> {
                                     // every workspace switch after the first
                                     // reload tiled under the bar.
                                     wm.gaps = compose_gaps(&new_cfg, bar_height);
+                                    // Re-apply the configured layout mode
+                                    // to every workspace. Runtime
+                                    // `toggle_layout` overrides are
+                                    // intentionally lost on reload \u2014 the
+                                    // config file is the source of truth
+                                    // for the desired baseline.
+                                    wm.apply_layout_mode_all(map_layout(new_cfg.general.layout));
                                     dwmend_platform::focus_border::set_color(parse_focus_color(&new_cfg));
                                     dwmend_platform::focus_border::set_width(new_cfg.general.border_width);
                                     dwmend_platform::focus_border::set_radius(new_cfg.general.corner_radius);
+                                    // Bar theme + segments are hot-reloadable.
+                                    ui::bar::set_colors(parse_bar_colors(&new_cfg.bar));
+                                    ui::bar::set_segments(bar_segments_from_cfg(&new_cfg.bar));
                                     wm.on_already_visible =
                                         new_cfg.general.on_workspace_already_visible.into();
                                     let _ = wm.retile_all();
@@ -477,4 +541,52 @@ fn parse_focus_color(cfg: &config::Config) -> u32 {
         );
         FALLBACK
     })
+}
+
+/// Build a `BarColors` from the `[bar.colors]` config table. Each field is
+/// parsed independently so a single typo only fails its own slot \u2014 the
+/// rest of the bar still reflects the user's edits.
+fn parse_bar_colors(cfg: &config::Bar) -> ui::bar::BarColors {
+    let defaults = ui::bar::BarColors::default();
+    let parse = |name: &str, s: &str, fallback: u32| {
+        config::parse_border_color(s).unwrap_or_else(|e| {
+            tracing::warn!(field = name, value = s, error = %e,
+                "bad bar color; using default");
+            fallback
+        })
+    };
+    ui::bar::BarColors {
+        background: parse("background", &cfg.colors.background, defaults.background),
+        foreground: parse("foreground", &cfg.colors.foreground, defaults.foreground),
+        active_bg: parse("active_bg", &cfg.colors.active_bg, defaults.active_bg),
+        active_fg: parse("active_fg", &cfg.colors.active_fg, defaults.active_fg),
+        visible_outline: parse(
+            "visible_outline",
+            &cfg.colors.visible_outline,
+            defaults.visible_outline,
+        ),
+        dim_fg: parse("dim_fg", &cfg.colors.dim_fg, defaults.dim_fg),
+    }
+}
+
+/// Translate `[bar]` segment toggles into the bar crate's `BarSegments`.
+fn bar_segments_from_cfg(cfg: &config::Bar) -> ui::bar::BarSegments {
+    ui::bar::BarSegments {
+        icon: cfg.show_icon,
+        workspaces: cfg.show_workspaces,
+        focused_title: cfg.show_focused_title,
+        clock: cfg.show_clock,
+        battery: cfg.show_battery,
+        network: cfg.show_network,
+        pause_indicator: cfg.show_pause_indicator,
+    }
+}
+
+/// TOML `general.layout` \u2192 layout-engine enum. Kept in `daemon.rs` so
+/// `dwmend-layout` doesn't need to know about serde / the wire format.
+fn map_layout(k: config::LayoutKind) -> dwmend_layout::bsp::LayoutMode {
+    match k {
+        config::LayoutKind::Dwindle => dwmend_layout::bsp::LayoutMode::Dwindle,
+        config::LayoutKind::Spiral => dwmend_layout::bsp::LayoutMode::Spiral,
+    }
 }

@@ -5,6 +5,7 @@ use super::WindowManager;
 use crate::window::WindowMode;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
+use dwmend_layout::bsp::LayoutMode;
 use dwmend_platform::{Direction, Rect};
 
 impl WindowManager {
@@ -48,6 +49,49 @@ impl WindowManager {
             tracing::debug!(?dir, "move_focused_direction: no focused window");
             return Ok(());
         };
+
+        // Floating-window branch: translate the stored absolute rect.
+        // The next `retile_workspace` clamps the rect into the workspace's
+        // work area via `Rect::clamp_inside`, so we don't need to bound
+        // here \u2014 the user can hammer the key past the screen edge and
+        // the window simply stops at the edge.
+        if matches!(
+            self.windows.get(&focused).map(|mw| mw.mode),
+            Some(WindowMode::Floating)
+        ) {
+            // 32-px step matches the resize default and komorebi's
+            // floating-move keybinding default. Hard-coded because the
+            // grammar `move <dir>` doesn't carry a delta; if a user
+            // wants finer control they can use `resize` for size +
+            // multiple `move` presses for position.
+            const STEP: i32 = 32;
+            let (dx, dy) = match dir {
+                Direction::Left => (-STEP, 0),
+                Direction::Right => (STEP, 0),
+                Direction::Up => (0, -STEP),
+                Direction::Down => (0, STEP),
+            };
+            let mut moved = false;
+            if let Some(ws) = self.workspaces.get_mut(&ws_id)
+                && let Some(entry) = ws.floating.iter_mut().find(|(w, _)| *w == focused)
+            {
+                entry.1.x += dx;
+                entry.1.y += dy;
+                moved = true;
+            }
+            tracing::debug!(
+                ?dir,
+                workspace = ws_id.0,
+                hwnd = format!("{:#x}", focused.0),
+                moved,
+                "move_focused_direction (floating)"
+            );
+            if moved {
+                self.retile_workspace(ws_id)?;
+            }
+            return Ok(());
+        }
+
         let work_area = self.workspace_work_area(ws_id).unwrap_or_default();
         let moved = self
             .workspaces
@@ -74,6 +118,58 @@ impl WindowManager {
         let Some(focused) = self.focused_window else {
             return Ok(());
         };
+
+        // Floating-window branch: change the rect's size + (for left/up)
+        // its origin. `resize right +N` grows the right edge; `resize
+        // left +N` grows the left edge (origin shifts left, width grows
+        // by N). Width / height are clamped to a 64-px minimum so the
+        // user can't accidentally shrink the window down to nothing.
+        if matches!(
+            self.windows.get(&focused).map(|mw| mw.mode),
+            Some(WindowMode::Floating)
+        ) {
+            const MIN_DIM: i32 = 64;
+            let mut resized = false;
+            if let Some(ws) = self.workspaces.get_mut(&ws_id)
+                && let Some(entry) = ws.floating.iter_mut().find(|(w, _)| *w == focused)
+            {
+                let r = &mut entry.1;
+                match dir {
+                    Direction::Right => r.w = (r.w + delta_px).max(MIN_DIM),
+                    Direction::Down => r.h = (r.h + delta_px).max(MIN_DIM),
+                    Direction::Left => {
+                        // Grow / shrink the left edge by `delta_px`.
+                        // Position moves left when delta_px > 0; if
+                        // shrinking past MIN_DIM we cap so the right
+                        // edge stays put.
+                        let new_w = (r.w + delta_px).max(MIN_DIM);
+                        let actual_delta = new_w - r.w;
+                        r.x -= actual_delta;
+                        r.w = new_w;
+                    }
+                    Direction::Up => {
+                        let new_h = (r.h + delta_px).max(MIN_DIM);
+                        let actual_delta = new_h - r.h;
+                        r.y -= actual_delta;
+                        r.h = new_h;
+                    }
+                }
+                resized = true;
+            }
+            tracing::debug!(
+                ?dir,
+                delta_px,
+                workspace = ws_id.0,
+                hwnd = format!("{:#x}", focused.0),
+                resized,
+                "resize_focused (floating)"
+            );
+            if resized {
+                self.retile_workspace(ws_id)?;
+            }
+            return Ok(());
+        }
+
         let work_area = self.workspace_work_area(ws_id).unwrap_or_default();
         if let Some(ws) = self.workspaces.get_mut(&ws_id) {
             ws.tree.resize(focused, dir, delta_px, work_area);
@@ -89,6 +185,27 @@ impl WindowManager {
             ws.monocle = !ws.monocle;
         }
         self.retile_workspace(ws_id)
+    }
+
+    /// Cycle the focused workspace's BSP layout mode (Dwindle \u2194 Spiral).
+    ///
+    /// Layout mode controls how `BspTree::insert` chooses a split axis;
+    /// flipping it leaves existing splits untouched and only affects
+    /// future inserts. No retile is required because no rect changed,
+    /// but we publish a debug log so users can confirm the toggle fired.
+    pub fn toggle_layout_mode(&mut self) -> Result<()> {
+        let ws_id = self
+            .focused_workspace_id()
+            .ok_or_else(|| eyre!("no focused workspace"))?;
+        if let Some(ws) = self.workspaces.get_mut(&ws_id) {
+            let new_mode = match ws.tree.layout_mode() {
+                LayoutMode::Dwindle => LayoutMode::Spiral,
+                LayoutMode::Spiral => LayoutMode::Dwindle,
+            };
+            ws.tree.set_layout_mode(new_mode);
+            tracing::info!(workspace = ws_id.0, mode = ?new_mode, "layout mode toggled");
+        }
+        Ok(())
     }
 
     /// Toggle stack mode on the focused tile. Smart by design: when the

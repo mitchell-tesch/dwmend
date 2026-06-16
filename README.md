@@ -11,13 +11,14 @@ A lightweight (and opinionated) tiling window manager for Windows 11, inspired b
 
 - **Lightweight** — single daemon binary.
 - **No elevation, no installer** — run as a user without elevated Administration permissions. `dwmend autostart enable` writes an HKCU `Run` entry so the daemon launches on next sign-in. `dwmend autostart disable` removes it.
-- **Dynamic tiling** — Binary Space Partition (BSP) approach ie. dwindle-style, one tree per monitor.
+- **Dynamic tiling** — Binary Space Partition (BSP) approach. Two layout modes: **dwindle** (aspect-ratio splits, default) and **spiral** (alternating axis splits). Switch globally via `[general] layout = "spiral"` in config or per-workspace via the `toggle_layout` action.
 - **Global workspace pool** — 10 named workspaces; `Alt+#` (where # is the workspace number) brings a workspace to the focused monitor (swapping it from whichever monitor was showing it). `Alt+Shift+N` moves the focused window *and* follows focus to the target workspace.
-- **Status bar** — thin GDI bar on each monitor showing workspace pills (active / visible-elsewhere / occupied / empty), the focused window title centred on the bar and a clock / battery / network indicators on the right.
+- **Status bar** — thin GDI bar on each monitor showing workspace pills (active / visible-elsewhere / occupied / empty), the focused window title centred on the bar and a clock / battery / network indicators on the right. **Click a pill to switch that monitor's workspace.** Colours, height, and per-segment toggles are configurable under `[bar]`.
 - **Active tile focus border** — thick configurable-colour overlay frame around the active tile.
 - **Stack containers** — group multiple windows into one tile. `Alt+G` is smart: with two tiles side-by-side it merges them into a stack on the first press; with a single tile it converts it to a 1-member stack so subsequent windows pile in. `Alt+[` / `Alt+]` cycle through. `Alt+Shift+G` pops the focused member back out into its own tile. The bar shows a `[2/3]` indicator next to the focused title when applicable.
-- **TOML config + hot reload** — gaps, colours, rules update on save. 
-  (Keybindings need a daemon restart due to `RegisterHotKey` semantics.)
+- **Floating window keyboard control** — `Alt+Shift+H/J/K/L` translates the focused float by 32 px; `Alt+Ctrl+H/J/K/L` resizes the matching edge by 32 px.
+- **Window rules** — match by `exe` / `class` / `title` regex; actions are `ignore`, `float`, `tile`, or `workspace = N` to pin matching apps to a specific workspace at launch (without stealing the user's focus).
+- **TOML config + hot reload** — gaps, colours, rules, **keybindings**, bar theme/segments all update on save. Bar height changes still need a daemon restart.
 - **IPC** — named-pipe server at `\\.\pipe\DwmendDaemon-v1`. Use `dwmend cmd "focus left"` from PowerShell / AutoHotKey / StreamDeck to drive the daemon, or `dwmend query state` to introspect.
 - **Crash recovery** — `dwmend.exe restore` makes any windows **DWMend** hid visible again if the daemon crashes or is force-killed.
 
@@ -70,8 +71,8 @@ On first launch a default config is emitted to
 | Combo | Action |
 |---|---|
 | `Alt+H/J/K/L` | focus left/down/up/right |
-| `Alt+Shift+H/J/K/L` | move focused tile |
-| `Alt+Ctrl+H/J/K/L` | resize 32 px |
+| `Alt+Shift+H/J/K/L` | move focused tile (or translate float by 32 px) |
+| `Alt+Ctrl+H/J/K/L` | resize 32 px (tiled split or floating edge) |
 | `Alt+1`..`Alt+0` | switch to workspace 1..10 |
 | `Alt+Shift+1`..`Alt+Shift+0` | move focused window to workspace |
 | `Alt+T` / `Alt+F` / `Alt+W` | toggle float / monocle / close |
@@ -80,11 +81,14 @@ On first launch a default config is emitted to
 | `Alt+]` / `Alt+[` | cycle to next / previous stack member |
 | `Alt+P` | pause/resume **DWMend** |
 | `Alt+Shift+R` / `Alt+Shift+Q` | reload config / quit |
+| Bar pill click | switch the clicked bar's monitor to that workspace |
+
+The `toggle_layout` action (Dwindle ↔ Spiral on the focused workspace) ships unbound; add `"ALT+SHIFT+L" = "toggle_layout"` (or any other combo) to your `[keybindings]` to wire it up.
 
 If any binding fails to register (because another app already claimed it),
 **DWMend** logs a warning at startup and that binding is silently no-op.
 
-> **Existing configs**: DWMen only writes the default config on first run. Bindings introduced after your initial install (such as the stack commands above) won't be present in your existing `%APPDATA%\dwmend\config.toml` — add them manually and restart `dwmend.exe`. Keybinding changes are not picked up by `Alt+Shift+R` (a `RegisterHotKey` limitation).
+> **Existing configs**: DWMend only writes the default config on first run. New options (the `[bar]` section, `general.layout`, the stack / `toggle_layout` actions, the `workspace = N` rule action) won't be present in your existing `%APPDATA%\dwmend\config.toml` — add them manually. The defaults match the previous hard-coded values, so omitting them keeps the old behaviour. Keybinding edits ARE picked up by `Alt+Shift+R` (the listener thread is torn down and respawned with the new table).
 
 ## Privacy
 

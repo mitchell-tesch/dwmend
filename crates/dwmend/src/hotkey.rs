@@ -224,6 +224,7 @@ pub fn parse_action(s: &str) -> Result<Command> {
         "toggle_float" => Ok(Command::ToggleFloat),
         "toggle_monocle" => Ok(Command::ToggleMonocle),
         "toggle_stack" => Ok(Command::ToggleStack),
+        "toggle_layout" => Ok(Command::ToggleLayoutMode),
         "stack_swallow" => {
             let dir = parse_dir(parts.next())?;
             Ok(Command::StackSwallow(dir))

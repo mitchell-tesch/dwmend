@@ -64,10 +64,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, LoadImageW, MSG, PostMessageW, PostThreadMessageW, RegisterClassExW,
     SET_WINDOW_POS_FLAGS, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetTimer,
     SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_ERASEBKGND,
-    WM_PAINT, WM_QUIT, WM_TIMER, WM_USER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    WM_LBUTTONUP, WM_PAINT, WM_QUIT, WM_TIMER, WM_USER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::PCWSTR;
+
+use crate::commands::Command;
+use crate::ids::{MonitorId, WorkspaceId};
 
 /// Default bar height in pixels.
 pub const DEFAULT_HEIGHT: i32 = 28;
@@ -155,6 +158,35 @@ impl Default for BarColors {
     }
 }
 
+/// Per-zone visibility toggles. Each zone collapses cleanly when off:
+/// the surrounding zones reflow to occupy the freed space, so e.g.
+/// disabling the network indicator pushes battery + clock further right
+/// rather than leaving a gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarSegments {
+    pub icon: bool,
+    pub workspaces: bool,
+    pub focused_title: bool,
+    pub clock: bool,
+    pub battery: bool,
+    pub network: bool,
+    pub pause_indicator: bool,
+}
+
+impl Default for BarSegments {
+    fn default() -> Self {
+        Self {
+            icon: true,
+            workspaces: true,
+            focused_title: true,
+            clock: true,
+            battery: true,
+            network: true,
+            pause_indicator: true,
+        }
+    }
+}
+
 // ---- shared state ----------------------------------------------------------
 
 /// One slot per monitor; lookup keyed by stable monitor id.
@@ -170,15 +202,41 @@ struct BarHandle {
     /// `H:MM AM/PM` clock only needs one repaint per minute, not 60.
     /// `WM_WTM_BAR_REFRESH` (event-driven repaints) bypasses this gate.
     last_painted_minute: AtomicI32,
+    /// Hit-test cache: each `(workspace_id, rect)` is the bounding box of
+    /// a workspace pill from the most recent `draw_bar` pass. Stored here
+    /// so `WM_LBUTTONUP` can map a click coordinate back to a workspace
+    /// without re-running the layout maths. Empty until the first paint.
+    pill_rects: Mutex<Vec<(u32, RECT)>>,
 }
 
 static BARS: OnceLock<Mutex<BarMap>> = OnceLock::new();
 static COLORS: OnceLock<Mutex<BarColors>> = OnceLock::new();
+/// Per-zone visibility, hot-swapped via [`set_segments`]. Defaults are
+/// applied via `BarSegments::default()` if the host never calls the
+/// setter (e.g. older binary linked against the new lib without an
+/// updated config).
+static SEGMENTS: Mutex<BarSegments> = Mutex::new(BarSegments {
+    icon: true,
+    workspaces: true,
+    focused_title: true,
+    clock: true,
+    battery: true,
+    network: true,
+    pause_indicator: true,
+});
 static HEIGHT: AtomicIsize = AtomicIsize::new(DEFAULT_HEIGHT as isize);
 static LISTENER_TID: AtomicIsize = AtomicIsize::new(0);
 /// Pending spec list for the next WM_WTM_BAR_SYNC. The host writes,
 /// the bar thread consumes.
 static PENDING_SYNC: Mutex<Option<Vec<BarSpec>>> = Mutex::new(None);
+
+/// Sender half of the daemon's command channel, published by
+/// [`set_command_tx`] right after the daemon creates the channel. The bar
+/// thread reads this when it dispatches a pill-click into a
+/// [`Command::SwitchWorkspaceOnMonitor`]. None until the daemon
+/// initialises it; clicks are silently ignored in that brief window so
+/// the bar can't crash a half-bootstrapped daemon.
+static CMD_TX: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 
 /// Cached GDI resources used by every `draw_bar` call. Without this cache,
 /// each paint creates and destroys a font + 2 brushes + 1 pen — `CreateFontW`
@@ -438,6 +496,71 @@ pub fn stop() {
     }
 }
 
+/// Replace the active theme colours. Drops the cached GDI brushes / pen
+/// so the next paint reallocates with the new palette, then forces a
+/// repaint of every bar so the change is immediately visible.
+///
+/// Called by the daemon on `[bar.colors]` config-reload. No-op if the
+/// bar subsystem hasn't been started.
+pub fn set_colors(new: BarColors) {
+    let Some(slot) = COLORS.get() else { return };
+    {
+        let mut g = slot.lock();
+        if *g == new {
+            return;
+        }
+        *g = new;
+    }
+    // Free the old brushes so `get_or_create_resources` rebuilds with
+    // the new palette on the next paint. Without this, the existing
+    // single-slot cache would happily reuse the *previous* colours.
+    drop_cached_resources();
+    invalidate_all_bars();
+    tracing::info!("bar colors updated");
+}
+
+/// Replace the active segment toggles. Hot-reloadable.
+pub fn set_segments(new: BarSegments) {
+    {
+        let mut g = SEGMENTS.lock();
+        if *g == new {
+            return;
+        }
+        *g = new;
+    }
+    invalidate_all_bars();
+    tracing::info!(?new, "bar segments updated");
+}
+
+/// Publish the daemon's command-channel sender so bar pill clicks can
+/// drive workspace switches. The daemon calls this once during bootstrap,
+/// after creating its `cmd_tx`. Calling more than once just replaces the
+/// previously-stored sender, which is fine (the old one's only consumer
+/// path was bar clicks).
+pub fn set_command_tx(tx: Sender<Command>) {
+    *CMD_TX.lock() = Some(tx);
+}
+
+/// Force an immediate repaint of every bar. Used after a state change
+/// the bar's painters depend on (colours, segments) but which doesn't
+/// flow through a per-monitor `BarSnapshot`.
+fn invalidate_all_bars() {
+    let Some(bars) = BARS.get() else { return };
+    let bars = bars.lock();
+    for handle in bars.values() {
+        // SAFETY: hwnd is one of our own windows. WM_WTM_BAR_REFRESH is
+        // routed to InvalidateRect by the bar's wnd_proc.
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(handle.hwnd as *mut _)),
+                WM_WTM_BAR_REFRESH,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 /// Reconcile the live bar set with `specs`. Any bar whose `monitor_id` is
 /// not in `specs` has its HWND destroyed (so dead-monitor bars stop
 /// floating around on the surviving display); any spec without a current
@@ -594,6 +717,7 @@ fn create_bar_hwnd(
             hwnd: hwnd.0 as isize,
             snapshot,
             last_painted_minute: AtomicI32::new(-1),
+            pill_rects: Mutex::new(Vec::new()),
         },
     );
     // SAFETY: HWND from our own CreateWindow.
@@ -732,6 +856,23 @@ unsafe extern "system" fn wnd_proc(
             unsafe { handle_paint(hwnd) };
             LRESULT(0)
         }
+        WM_LBUTTONUP => {
+            // Left-click on a workspace pill switches the workspace
+            // SHOWN ON THE BAR'S MONITOR (not the focused one). Clicks
+            // outside the pill row are silently ignored.
+            //
+            // lparam encodes the click point as two i16's packed into
+            // its low DWORD: low word = x, high word = y, both
+            // client-relative. We sign-extend through `i16` so a click
+            // on a multi-monitor virtual desktop with negative coords
+            // still hit-tests correctly (defensive — bar windows live in
+            // the positive client space, but cheap insurance).
+            let lo = lparam.0 as i32;
+            let x = (lo & 0xFFFF) as i16 as i32;
+            let y = ((lo >> 16) & 0xFFFF) as i16 as i32;
+            handle_pill_click(hwnd, x, y);
+            LRESULT(0)
+        }
         WM_DESTROY => LRESULT(0),
         // SAFETY: DefWindowProcW is the documented fallback handler.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -749,6 +890,12 @@ unsafe fn handle_paint(hwnd: HWND) {
     // Read snapshot for this bar.
     let snapshot = lookup_snapshot(hwnd);
     let colors = COLORS.get().map(|m| *m.lock()).unwrap_or_default();
+
+    // Collected by `draw_bar` and stashed back into the BarHandle so
+    // `WM_LBUTTONUP` can hit-test against it. Stays empty in the rare
+    // path where every paint attempt fails (DC creation OOM etc.) so a
+    // click during that frame just no-ops.
+    let mut pill_hits: Vec<(u32, RECT)> = Vec::new();
 
     // Double-buffer: render to an off-screen memory DC, then BitBlt the
     // entire result onto the window DC. Without this, the user sees the
@@ -772,7 +919,11 @@ unsafe fn handle_paint(hwnd: HWND) {
                 bottom: height,
             };
             // SAFETY: mem_dc valid; geometry derived from the paint clip.
-            unsafe { draw_bar(mem_dc, mem_rc, &snapshot, &colors) };
+            // Pill rects come back in mem_dc-local coords; since we always
+            // invalidate the whole bar, ps.rcPaint = mem_rc = bar client
+            // rect, so these coords are already client-space \u2014 no
+            // translation needed before storing.
+            pill_hits = unsafe { draw_bar(mem_dc, mem_rc, &snapshot, &colors) };
             // Atomically copy the finished bar onto the screen.
             // SAFETY: both DCs valid; src/dst rects match.
             let _ = unsafe {
@@ -799,7 +950,9 @@ unsafe fn handle_paint(hwnd: HWND) {
             // Couldn't allocate the memory DC — fall back to painting
             // directly. Loses double-buffering for this frame but still draws.
             // SAFETY: hdc valid; geometry comes from the PAINTSTRUCT clip.
-            unsafe { draw_bar(hdc, ps.rcPaint, &snapshot, &colors) };
+            // ps.rcPaint is bar-client space; rects returned here are
+            // already in client coords for the WM_LBUTTONUP hit test.
+            pill_hits = unsafe { draw_bar(hdc, ps.rcPaint, &snapshot, &colors) };
             // Clean up whichever handle was created.
             if !mem_dc.is_invalid() {
                 // SAFETY: mem_dc was created by CreateCompatibleDC.
@@ -809,6 +962,15 @@ unsafe fn handle_paint(hwnd: HWND) {
                 // SAFETY: mem_bmp was created by CreateCompatibleBitmap.
                 let _ = unsafe { DeleteObject(HGDIOBJ(mem_bmp.0)) };
             }
+        }
+    }
+
+    // Stash pill rects for `WM_LBUTTONUP` hit-testing. Done OUTSIDE the
+    // GDI path so a panic in painting can't poison the cached rects.
+    if let Some(bars) = BARS.get() {
+        let bars = bars.lock();
+        if let Some(handle) = bars.values().find(|h| h.hwnd == hwnd.0 as isize) {
+            *handle.pill_rects.lock() = pill_hits;
         }
     }
 
@@ -838,12 +1000,54 @@ fn empty_snapshot() -> BarSnapshot {
     }
 }
 
-unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) {
+/// Hit-test a `(x, y)` click against the cached pill rects of the bar
+/// at `hwnd`, dispatching `Command::SwitchWorkspaceOnMonitor` for the
+/// match (if any). No-op when:
+/// * the click misses every pill;
+/// * the bar's monitor isn't tracked (never happens in practice but
+///   defensive against bar destruction races);
+/// * the daemon hasn't published its `cmd_tx` yet (bootstrap window).
+///
+/// We extract the data we need under the BARS lock, then drop both
+/// locks before sending on the channel \u2014 a slow daemon can't stall the
+/// bar's message pump even if the channel filled.
+fn handle_pill_click(hwnd: HWND, x: i32, y: i32) {
+    let key = hwnd.0 as isize;
+    let click = {
+        let Some(bars) = BARS.get() else { return };
+        let bars = bars.lock();
+        let Some((mid, handle)) = bars.iter().find(|(_, h)| h.hwnd == key) else {
+            return;
+        };
+        let pills = handle.pill_rects.lock();
+        pills
+            .iter()
+            .find(|(_, r)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+            .map(|(ws_id, _)| (*ws_id, mid.clone()))
+    };
+    let Some((ws_id, monitor_id)) = click else {
+        return;
+    };
+    let tx = CMD_TX.lock().clone();
+    if let Some(tx) = tx {
+        let cmd = Command::SwitchWorkspaceOnMonitor(WorkspaceId(ws_id), MonitorId(monitor_id));
+        if let Err(e) = tx.try_send(cmd) {
+            tracing::warn!(error = %e, ws = ws_id, "bar pill click: cmd_tx send failed");
+        }
+    }
+}
+
+unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) -> Vec<(u32, RECT)> {
     // Resolve cached GDI handles for the current (height, colors). On the
     // first paint after startup (or after a config reload that changed
     // colors) this allocates; thereafter it's a pure HashMap-style lookup.
     let bar_height = HEIGHT.load(Ordering::SeqCst) as i32;
     let res = get_or_create_resources(bar_height, colors);
+
+    // Snapshot segment toggles once for the whole paint so a concurrent
+    // `set_segments` mid-frame can't make the layout inconsistent (e.g.
+    // measure the clock width then skip drawing it).
+    let segments = *SEGMENTS.lock();
 
     // Background fill — reuses the cached brush. FillRect does not consume
     // the brush handle, so the next paint reuses the same one.
@@ -876,7 +1080,11 @@ unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) {
     let bar_inner_h = rc.bottom - rc.top;
     let icon_size = (bar_inner_h - 8).clamp(16, 32);
     let icon_zone_left = rc.left + icon_pad_left;
-    let icon_zone_right = if let Some(hicon) = bar_icon(icon_size) {
+    let icon_zone_right = if !segments.icon {
+        // Segment off — pills start flush left so disabling the icon
+        // doesn't leave dead space.
+        rc.left
+    } else if let Some(hicon) = bar_icon(icon_size) {
         let icon_y = rc.top + (bar_inner_h - icon_size) / 2;
         // SAFETY: hicon is a valid HICON (or LR_SHARED would have failed
         // and `bar_icon` returned None); hdc is the live paint DC; the
@@ -906,72 +1114,94 @@ unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) {
     // horizontal padding so adjacent pills don't touch.
     let pill_w = (rc.bottom - rc.top) - 6;
     let mut x = icon_zone_right;
-    for ws in &snap.workspaces {
-        let pill = RECT {
-            left: x,
-            top: rc.top,
-            right: x + pill_w,
-            bottom: rc.bottom,
-        };
-        // Decide background treatment + text colour for this pill.
-        let text_color = if ws.is_active {
-            // SAFETY: active_brush owned by cache.
-            let _ = unsafe {
-                FillRect(
-                    hdc,
-                    &pill,
-                    windows::Win32::Graphics::Gdi::HBRUSH(res.active_brush as *mut _),
-                )
+    // Hit-test cache built up alongside the visual paint so the wnd_proc
+    // can route `WM_LBUTTONUP` to the correct workspace without re-running
+    // any layout maths. Always returned, even when `segments.workspaces`
+    // is off (in which case it's empty and clicks are ignored).
+    let mut pill_hits: Vec<(u32, RECT)> = Vec::with_capacity(snap.workspaces.len());
+    if segments.workspaces {
+        for ws in &snap.workspaces {
+            let pill = RECT {
+                left: x,
+                top: rc.top,
+                right: x + pill_w,
+                bottom: rc.bottom,
             };
-            colors.active_fg
-        } else if ws.is_visible {
-            // Outline the workspace shown on another monitor. Stock
-            // NULL_BRUSH keeps the interior transparent so the bar shows
-            // through. Pen is cached; null brush is a stock object we
-            // never own.
-            // SAFETY: visible_pen owned by cache.
-            let old_pen = unsafe { SelectObject(hdc, HGDIOBJ(res.visible_pen as *mut _)) };
-            let null_brush = unsafe { GetStockObject(NULL_BRUSH) };
-            let old_brush = unsafe { SelectObject(hdc, null_brush) };
-            let _ = unsafe { Rectangle(hdc, pill.left, pill.top, pill.right, pill.bottom) };
-            unsafe { SelectObject(hdc, old_brush) };
-            unsafe { SelectObject(hdc, old_pen) };
-            colors.foreground
-        } else if ws.has_windows {
-            colors.foreground
-        } else {
-            colors.dim_fg
-        };
+            pill_hits.push((ws.id, pill));
+            // Decide background treatment + text colour for this pill.
+            let text_color = if ws.is_active {
+                // SAFETY: active_brush owned by cache.
+                let _ = unsafe {
+                    FillRect(
+                        hdc,
+                        &pill,
+                        windows::Win32::Graphics::Gdi::HBRUSH(res.active_brush as *mut _),
+                    )
+                };
+                colors.active_fg
+            } else if ws.is_visible {
+                // Outline the workspace shown on another monitor. Stock
+                // NULL_BRUSH keeps the interior transparent so the bar shows
+                // through. Pen is cached; null brush is a stock object we
+                // never own.
+                // SAFETY: visible_pen owned by cache.
+                let old_pen = unsafe { SelectObject(hdc, HGDIOBJ(res.visible_pen as *mut _)) };
+                let null_brush = unsafe { GetStockObject(NULL_BRUSH) };
+                let old_brush = unsafe { SelectObject(hdc, null_brush) };
+                let _ = unsafe { Rectangle(hdc, pill.left, pill.top, pill.right, pill.bottom) };
+                unsafe { SelectObject(hdc, old_brush) };
+                unsafe { SelectObject(hdc, old_pen) };
+                colors.foreground
+            } else if ws.has_windows {
+                colors.foreground
+            } else {
+                colors.dim_fg
+            };
 
-        let label = format!("{}", ws.id);
-        // SAFETY: hdc valid and font is selected for the whole draw_bar call.
-        unsafe { draw_centered_text(hdc, pill, &label, text_color, DRAW_TEXT_FORMAT(0)) };
+            let label = format!("{}", ws.id);
+            // SAFETY: hdc valid and font is selected for the whole draw_bar call.
+            unsafe { draw_centered_text(hdc, pill, &label, text_color, DRAW_TEXT_FORMAT(0)) };
 
-        x += pill_w + 4;
+            x += pill_w + 4;
+        }
     }
     let pill_zone_right = x;
 
     // ---- right edge: live clock + optional indicator ----
-    // SAFETY: GetLocalTime takes no inputs and always succeeds.
-    let now = unsafe { GetLocalTime() };
-    // 12-hour clock with AM/PM. wHour is 0..=23 from GetLocalTime; convert
-    // to 12-hour form: 0 -> 12 AM, 1..=11 -> AM, 12 -> 12 PM, 13..=23 -> PM.
-    let (h12, suffix) = match now.wHour {
-        0 => (12, "AM"),
-        1..=11 => (now.wHour, "AM"),
-        12 => (12, "PM"),
-        _ => (now.wHour - 12, "PM"),
+    // Clock is the rightmost zone and the anchor every other right-side
+    // zone measures from. When `segments.clock = false` we collapse it
+    // to a zero-width slot at `rc.right - 10` so battery / network /
+    // pause shift right to fill the freed space.
+    let (clock_str, clock_left, clock_right) = if segments.clock {
+        // SAFETY: GetLocalTime takes no inputs and always succeeds.
+        let now = unsafe { GetLocalTime() };
+        // 12-hour clock with AM/PM. wHour is 0..=23 from GetLocalTime; convert
+        // to 12-hour form: 0 -> 12 AM, 1..=11 -> AM, 12 -> 12 PM, 13..=23 -> PM.
+        let (h12, suffix) = match now.wHour {
+            0 => (12, "AM"),
+            1..=11 => (now.wHour, "AM"),
+            12 => (12, "PM"),
+            _ => (now.wHour - 12, "PM"),
+        };
+        let s = format!("{}:{:02} {}", h12, now.wMinute, suffix);
+        let w = measure_text(hdc, &s);
+        let right = rc.right - 10;
+        let left = right - w;
+        (Some(s), left, right)
+    } else {
+        let edge = rc.right - 10;
+        (None, edge, edge)
     };
-    let clock_str = format!("{}:{:02} {}", h12, now.wMinute, suffix);
-    let clock_w = measure_text(hdc, &clock_str);
-    let clock_right = rc.right - 10;
-    let clock_left = clock_right - clock_w;
 
     // ---- battery (drawn to the left of the clock) ----
     // The battery zone occupies its own slot on the right side; if the
     // device has no battery the slot collapses and the next zone (network /
     // right indicator) abuts the clock directly.
-    let battery_str = current_battery().map(format_battery);
+    let battery_str = if segments.battery {
+        current_battery().map(format_battery)
+    } else {
+        None
+    };
     let (battery_zone_left, battery_zone_right) = if let Some(ref s) = battery_str {
         let w = measure_text(hdc, s);
         let right = clock_left - 12;
@@ -986,7 +1216,11 @@ unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) {
     // offline) the slot vanishes and the right indicator sits where the
     // network glyph would have been.
     let network_anchor_right = battery_zone_left.unwrap_or(clock_left);
-    let network_str = current_network_cached().map(format_network);
+    let network_str = if segments.network {
+        current_network_cached().map(format_network)
+    } else {
+        None
+    };
     let (network_zone_left, network_zone_right) = if let Some(ref s) = network_str {
         let w = measure_text(hdc, s);
         let right = network_anchor_right - 10;
@@ -1002,19 +1236,23 @@ unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) {
         .or(battery_zone_left)
         .unwrap_or(clock_left);
     let mut right_zone_left = right_anchor_left;
-    let label_box = snap.right_label.as_ref().map(|label| {
-        let w = measure_text(hdc, label);
-        let right = right_anchor_left - 10;
-        let left = right - w;
-        right_zone_left = left;
-        (left, right)
-    });
+    let label_box = if segments.pause_indicator {
+        snap.right_label.as_ref().map(|label| {
+            let w = measure_text(hdc, label);
+            let right = right_anchor_left - 10;
+            let left = right - w;
+            right_zone_left = left;
+            (left, right)
+        })
+    } else {
+        None
+    };
 
     // ---- focused title (centred between pills and right zone) ----
     let safe_left = pill_zone_right + 10;
     let safe_right = right_zone_left - 10;
     let safe_w = safe_right - safe_left;
-    if safe_w > 0 && !snap.focused_title.is_empty() {
+    if segments.focused_title && safe_w > 0 && !snap.focused_title.is_empty() {
         let title_w = measure_text(hdc, &snap.focused_title);
         let (tl, tr) = if title_w >= safe_w {
             // Doesn't fit — fill the safe zone, GDI will ellipsize on the end.
@@ -1057,23 +1295,25 @@ unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) {
         unsafe { draw_centered_text(hdc, rect, label, colors.active_bg, DRAW_TEXT_FORMAT(0)) };
     }
 
-    // ---- live clock (right edge, always shown) ----
-    let clock_rect = RECT {
-        left: clock_left,
-        top: rc.top,
-        right: clock_right,
-        bottom: rc.bottom,
-    };
-    // SAFETY: hdc valid; font selected for the whole draw_bar call.
-    unsafe {
-        draw_centered_text(
-            hdc,
-            clock_rect,
-            &clock_str,
-            colors.foreground,
-            DRAW_TEXT_FORMAT(0),
-        )
-    };
+    // ---- live clock (right edge, shown unless `segments.clock` is off) ----
+    if let Some(s) = clock_str.as_ref() {
+        let clock_rect = RECT {
+            left: clock_left,
+            top: rc.top,
+            right: clock_right,
+            bottom: rc.bottom,
+        };
+        // SAFETY: hdc valid; font selected for the whole draw_bar call.
+        unsafe {
+            draw_centered_text(
+                hdc,
+                clock_rect,
+                s,
+                colors.foreground,
+                DRAW_TEXT_FORMAT(0),
+            )
+        };
+    }
 
     // ---- battery (left of clock, only when device has a battery) ----
     if let (Some(s), Some(left), Some(right)) =
@@ -1106,6 +1346,8 @@ unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) {
     // Restore the DC's original font selection. The cache owns the font
     // handle we selected in; do NOT DeleteObject it.
     unsafe { SelectObject(hdc, old_font) };
+
+    pill_hits
 }
 
 /// Snapshot of the device's battery state from `GetSystemPowerStatus`.

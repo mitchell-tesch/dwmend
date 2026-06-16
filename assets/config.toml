@@ -31,6 +31,36 @@ corner_radius = 8
 # Show a thin status bar at the top of each monitor with workspace numbers,
 # focused window title and pause indicator. Set false to disable.
 bar_enabled = true
+# Initial BSP layout mode applied to every workspace at startup:
+#   "dwindle" -> aspect-ratio driven splits (default; like i3 / Hyprland)
+#   "spiral"  -> alternating axis splits (canonical BSP spiral)
+# Use the `toggle_layout` action below to flip a single workspace at runtime.
+layout = "dwindle"
+
+[bar]
+# Bar height in pixels. Changes require a daemon restart (the value is
+# baked into the gap composer at bring-up). Other [bar] settings are
+# hot-reloadable.
+height = 28
+# Per-zone toggles. Disabling a zone collapses it; the surrounding zones
+# reflow to fill the freed space rather than leaving an empty slot.
+show_icon            = true
+show_workspaces      = true
+show_focused_title   = true
+show_clock           = true
+show_battery         = true
+show_network         = true
+show_pause_indicator = true
+
+[bar.colors]
+# Bar theme. Each value is a "#RRGGBB" string; bad colors fall back to
+# the defaults below with a warning in the log.
+background      = "#1E1E2E"
+foreground      = "#C0C0C0"
+active_bg       = "#4FC3F7"
+active_fg       = "#101018"
+visible_outline = "#808080"
+dim_fg          = "#606060"
 
 [keybindings]
 # Modifier names accepted: "SUPER" (Win), "ALT", "CTRL", "SHIFT".
@@ -43,10 +73,19 @@ bar_enabled = true
 # claimed it, you'll see a "Hot key is already registered" warning at
 # startup and that one binding will silently no-op.)
 #
+# Keybinding edits are now hot-reloaded on save (Alt+Shift+R or any
+# external save event). The `RegisterHotKey` listener thread is torn
+# down and respawned with the new table; failures keep the previous
+# bindings active and log an error.
+#
 # Action grammar:
 #   focus <left|right|up|down>
 #   move  <left|right|up|down>
+#                            (tiled: swap with neighbour;
+#                              floating: translate by 32 px)
 #   resize <left|right|up|down> <delta_px>
+#                            (tiled: nudge the nearest split;
+#                              floating: grow the matching edge)
 #   workspace <N>            (switch to workspace N)
 #   move_to_workspace <N>    (move focused window to workspace N)
 #   focus_monitor  <left|right|up|down>
@@ -56,6 +95,7 @@ bar_enabled = true
 #                              if the sibling is a Leaf or Stack; falls back
 #                              to a 1-member stack when the sibling is a
 #                              subtree or there is no sibling)
+#   toggle_layout            (Dwindle <-> Spiral on the focused workspace)
 #   stack_swallow <left|right|up|down>
 #                            (pull the neighbour in <dir> into the focused tile's
 #                              stack; useful when toggle_stack chose the wrong
@@ -132,7 +172,14 @@ bar_enabled = true
 
 # Rules are matched in order; first match wins.
 # Match keys: exe (basename, equals), class (regex), title (regex).
-# Action keys: action ("ignore" | "float" | "tile"), workspace (1..N)
+# Action keys:
+#   action = "ignore"     -> never manage matching windows.
+#   action = "float"      -> manage but mark as floating on first show.
+#   action = "tile"       -> if the window started floating, force tiled.
+#   action = "workspace"  -> route to a specific workspace at admit time.
+#                            REQUIRES a sibling `workspace = N` field.
+#                            The user's focus stays where it is unless N
+#                            is already the focused workspace.
 
 [[rules]]
 match.exe = "Spotify.exe"
@@ -142,3 +189,10 @@ action    = "ignore"
 match.class = "Chrome_WidgetWin_1"
 match.title = ".*Picture.in.Picture.*"
 action      = "float"
+
+# Example workspace-routing rule: pin Slack to workspace 5.
+# Uncomment + edit to enable.
+# [[rules]]
+# match.exe = "slack.exe"
+# action    = "workspace"
+# workspace = 5

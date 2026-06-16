@@ -138,6 +138,58 @@ pub fn stop() {
     }
 }
 
+/// Tear down the current listener and respawn it with `table`. The
+/// channel published by [`start`] is preserved \u2014 the new thread reads
+/// the same `EVENT_TX` slot \u2014 so the daemon's existing
+/// `Receiver<HotkeyMatch>` keeps working without reconnection.
+///
+/// Must be called only after [`start`]. Returns an error if the previous
+/// listener thread fails to exit within 500\u00a0ms (suggests a hung message
+/// pump) so the caller can surface a "still on old bindings" warning
+/// rather than spawning a duplicate thread.
+///
+/// Used by `dwmend.exe`'s config-reload path to apply `[keybindings]`
+/// edits without making the user restart the daemon. `RegisterHotKey`
+/// itself doesn't expose a "swap registrations" API \u2014 the only honest
+/// way to pick up a new combo is to destroy the owning HWND and rebuild.
+pub fn restart(table: HotkeyTable) -> Result<()> {
+    if EVENT_TX.get().is_none() {
+        return Err(eyre!("keyboard::restart called before start"));
+    }
+
+    // Tell the old thread to exit. It clears LISTENER_TID to 0 right
+    // before returning from its message pump, which is our "done"
+    // signal. We deliberately spin-wait rather than block-on-join
+    // because we don't store a `JoinHandle` (the original `start`
+    // didn't either, and threading a handle through every `OnceLock`
+    // path would be a wider refactor).
+    let old_tid = LISTENER_TID.load(Ordering::SeqCst) as u32;
+    if old_tid != 0 {
+        // SAFETY: posting to a thread ID is always safe.
+        unsafe {
+            let _ = PostThreadMessageW(old_tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while LISTENER_TID.load(Ordering::SeqCst) != 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err(eyre!(
+                "previous hotkey listener did not exit within 500 ms; \
+                 hot-reload aborted, old bindings remain active"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Old thread is gone (HWND destroyed, hotkeys unregistered, TID
+    // cleared). Spawn the replacement, reusing the same channel.
+    std::thread::Builder::new()
+        .name("dwmend-hotkeys".into())
+        .spawn(move || run_listener_thread(table))
+        .map_err(|e| eyre!("failed to respawn dwmend-hotkeys thread: {e}"))?;
+    Ok(())
+}
+
 // ---- listener thread --------------------------------------------------------
 
 fn run_listener_thread(table: HotkeyTable) {

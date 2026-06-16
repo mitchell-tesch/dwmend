@@ -20,6 +20,10 @@ use std::path::Path;
 #[serde(default)]
 pub struct Config {
     pub general: General,
+    /// Status bar customisation: height, per-segment toggles, colours.
+    /// All fields default to the v0.1 hard-coded values, so omitting
+    /// the `[bar]` section keeps the previous look exactly.
+    pub bar: Bar,
     /// Raw "key combo string" → "action string" map.
     /// Parsed into hotkey table in `hotkey.rs`.
     pub keybindings: HashMap<String, String>,
@@ -50,6 +54,24 @@ pub struct General {
     pub corner_radius: i32,
     /// Show a thin status bar at the top of each monitor.
     pub bar_enabled: bool,
+    /// Initial BSP layout mode applied to every workspace at startup.
+    /// Runtime swaps via the `toggle_layout` action are workspace-local
+    /// and survive until the next config reload, which re-applies this
+    /// value to every workspace.
+    pub layout: LayoutKind,
+}
+
+/// TOML-facing layout selector. Mapped onto
+/// [`dwmend_layout::bsp::LayoutMode`] in `daemon.rs` to keep the layout
+/// crate's public surface free of `serde` dependencies.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutKind {
+    /// Aspect-ratio driven splits (default \u2014 i3 / Hyprland behaviour).
+    #[default]
+    Dwindle,
+    /// Alternating axis splits (canonical BSP spiral).
+    Spiral,
 }
 
 impl Default for General {
@@ -66,6 +88,94 @@ impl Default for General {
             border_width: 3,
             corner_radius: dwmend_platform::focus_border::DEFAULT_RADIUS,
             bar_enabled: true,
+            layout: LayoutKind::Dwindle,
+        }
+    }
+}
+
+/// Status bar settings: dimensions, per-segment toggles, theme colours.
+///
+/// `height` is captured at startup; runtime changes require a daemon
+/// restart because the bar reserves screen real-estate via the gaps
+/// composer at process bring-up. Every other field is hot-reloadable
+/// (colours via `bar::set_colors`, segment toggles via
+/// `bar::set_segments`).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct Bar {
+    /// Bar height in pixels. Values <16 are clamped at startup so text
+    /// stays readable.
+    pub height: i32,
+    /// Show the app icon at the very left of the bar.
+    pub show_icon: bool,
+    /// Show workspace pills.
+    pub show_workspaces: bool,
+    /// Show the focused window's title centred on the bar.
+    pub show_focused_title: bool,
+    /// Show the live clock at the right edge.
+    pub show_clock: bool,
+    /// Show the battery indicator (collapses on devices without one).
+    pub show_battery: bool,
+    /// Show the network indicator (collapses when no adapter is up).
+    pub show_network: bool,
+    /// Show the "PAUSED" right-edge indicator while DWMend is paused.
+    pub show_pause_indicator: bool,
+    /// Theme colours.
+    pub colors: BarColorsConfig,
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Self {
+            // Height default mirrors `ui::bar::DEFAULT_HEIGHT`. Duplicated
+            // as a literal here because `dwmend-layout` (which `config.rs`
+            // could otherwise pull from) doesn't know about the bar, and
+            // we'd rather avoid pulling the host crate into the platform
+            // dep graph just to share one i32.
+            height: 28,
+            show_icon: true,
+            show_workspaces: true,
+            show_focused_title: true,
+            show_clock: true,
+            show_battery: true,
+            show_network: true,
+            show_pause_indicator: true,
+            colors: BarColorsConfig::default(),
+        }
+    }
+}
+
+/// `[bar.colors]` sub-table. Each value is an `"#RRGGBB"` string parsed
+/// via [`parse_border_color`] at apply time. The defaults reproduce the
+/// pre-config-driven look exactly so omitting the section is a no-op.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct BarColorsConfig {
+    /// Bar background fill.
+    pub background: String,
+    /// Default text colour for inactive workspace numbers, focused title,
+    /// clock / battery / network glyphs.
+    pub foreground: String,
+    /// Active workspace pill fill.
+    pub active_bg: String,
+    /// Active workspace pill text.
+    pub active_fg: String,
+    /// 1-px outline drawn on a pill whose workspace is visible on a
+    /// *different* monitor.
+    pub visible_outline: String,
+    /// Dimmed text used for empty inactive workspaces.
+    pub dim_fg: String,
+}
+
+impl Default for BarColorsConfig {
+    fn default() -> Self {
+        Self {
+            background: "#1E1E2E".to_string(),
+            foreground: "#C0C0C0".to_string(),
+            active_bg: "#4FC3F7".to_string(),
+            active_fg: "#101018".to_string(),
+            visible_outline: "#808080".to_string(),
+            dim_fg: "#606060".to_string(),
         }
     }
 }
@@ -103,7 +213,10 @@ impl From<AlreadyVisible> for crate::state::AlreadyVisibleBehaviour {
 pub struct RawRule {
     #[serde(rename = "match")]
     pub matcher: RuleMatcher,
-    pub action: RuleAction,
+    pub action: RawRuleAction,
+    /// Required when `action = "workspace"`; ignored otherwise. Resolved
+    /// into [`RuleAction::Workspace`] by [`Config::compile_rules`].
+    pub workspace: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -116,12 +229,31 @@ pub struct RuleMatcher {
     pub title: Option<String>,
 }
 
+/// Wire-level action tag. Lives only as long as TOML deserialisation; the
+/// host crate consumes the compiled [`RuleAction`] which folds the
+/// `workspace` sibling field in for the `Workspace` variant.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum RawRuleAction {
+    Ignore,
+    Float,
+    Tile,
+    /// Pin the window to a specific workspace at admit time. The
+    /// workspace number is supplied via the rule's sibling `workspace`
+    /// key \u2014 see [`RawRule`].
+    Workspace,
+}
+
+/// Resolved rule action consumed by `filter.rs` / `commands.rs`.
+///
+/// `Workspace(N)` carries the validated workspace number so admit-time
+/// dispatch never has to revisit the raw TOML representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleAction {
     Ignore,
     Float,
     Tile,
+    Workspace(u32),
 }
 
 /// A compiled rule — matchers as `Regex` for fast repeated evaluation.
@@ -183,11 +315,40 @@ impl Config {
                 .as_deref()
                 .map(|s| Regex::new(s).map_err(|e| eyre!("bad title regex `{s}`: {e}")))
                 .transpose()?;
+            // Resolve the wire-level action tag into the runtime variant.
+            // The `Workspace` tag REQUIRES the sibling `workspace` field;
+            // a missing or zero value is a hard error so a config typo
+            // doesn't silently fall back to "no rule".
+            let action = match raw.action {
+                RawRuleAction::Ignore => RuleAction::Ignore,
+                RawRuleAction::Float => RuleAction::Float,
+                RawRuleAction::Tile => RuleAction::Tile,
+                RawRuleAction::Workspace => {
+                    let n = raw.workspace.ok_or_else(|| {
+                        eyre!(
+                            "rule with action = \"workspace\" must set `workspace = N` \
+                             (matcher: exe={:?} class={:?} title={:?})",
+                            raw.matcher.exe,
+                            raw.matcher.class,
+                            raw.matcher.title
+                        )
+                    })?;
+                    if n == 0 {
+                        return Err(eyre!(
+                            "rule workspace must be >= 1 (matcher: exe={:?} class={:?} title={:?})",
+                            raw.matcher.exe,
+                            raw.matcher.class,
+                            raw.matcher.title
+                        ));
+                    }
+                    RuleAction::Workspace(n)
+                }
+            };
             out.push(Rule {
                 exe: raw.matcher.exe.clone(),
                 class_re,
                 title_re,
-                action: raw.action,
+                action,
             });
         }
         Ok(out)

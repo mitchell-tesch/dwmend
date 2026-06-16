@@ -5,12 +5,11 @@
 
 use crate::config::{Rule, RuleAction};
 use crate::filter::{first_matching_action, is_manageable};
-use crate::ids::{WindowId, WorkspaceId};
+use crate::ids::{MonitorId, WindowId, WorkspaceId};
 use crate::state::WindowManager;
 use crate::window::WindowMode;
 use color_eyre::Result;
 use dwmend_platform::Direction;
-
 #[derive(Debug, Clone)]
 pub enum Command {
     // ---- intra-workspace -------
@@ -23,6 +22,10 @@ pub enum Command {
     ToggleFloat,
     ToggleMonocle,
     ToggleStack,
+    /// Cycle the focused workspace through layout modes
+    /// (Dwindle \u2192 Spiral \u2192 Dwindle\u2026). Affects future inserts on the
+    /// workspace; existing splits keep their axes.
+    ToggleLayoutMode,
     StackSwallow(Direction),
     StackPop,
     FocusStackNext,
@@ -31,6 +34,11 @@ pub enum Command {
 
     // ---- workspaces ------------
     SwitchWorkspace(WorkspaceId),
+    /// Switch the workspace shown on a SPECIFIC monitor (rather than the
+    /// focused one). Used by bar-pill clicks: clicking pill 3 on
+    /// monitor B should bring workspace 3 to monitor B even when the
+    /// user's focus is currently on monitor A.
+    SwitchWorkspaceOnMonitor(WorkspaceId, MonitorId),
     MoveFocusedToWorkspace(WorkspaceId),
 
     // ---- monitors --------------
@@ -57,6 +65,7 @@ pub fn dispatch(wm: &mut WindowManager, cmd: Command) -> Result<()> {
         ToggleFloat => wm.toggle_float(),
         ToggleMonocle => wm.toggle_monocle(),
         ToggleStack => wm.toggle_stack(),
+        ToggleLayoutMode => wm.toggle_layout_mode(),
         StackSwallow(d) => wm.stack_swallow(d),
         StackPop => wm.stack_pop(),
         FocusStackNext => wm.focus_stack_next(),
@@ -64,6 +73,7 @@ pub fn dispatch(wm: &mut WindowManager, cmd: Command) -> Result<()> {
         CloseFocused => wm.close_focused(),
 
         SwitchWorkspace(ws) => wm.switch_workspace(ws),
+        SwitchWorkspaceOnMonitor(ws, mid) => wm.switch_workspace_on_monitor(ws, mid),
         MoveFocusedToWorkspace(ws) => wm.move_focused_to_workspace(ws),
 
         FocusMonitor(d) => wm.focus_monitor_direction(d),
@@ -96,15 +106,55 @@ pub fn admit(wm: &mut WindowManager, rules: &[Rule], win: dwmend_platform::windo
     let exe = win.exe_name();
 
     let id = WindowId(win.0);
-    if wm.manage(id, title, class.clone(), exe.clone()).is_err() {
+    let action = first_matching_action(win, &class, rules);
+
+    // Workspace routing happens INSIDE `manage_routed` so the new window
+    // is placed on the target workspace from the very first retile,
+    // avoiding a brief flash on the focused workspace before being moved.
+    // We still fall back to the default admit when the configured target
+    // workspace doesn't exist (typo / out-of-range N) so the rule failure
+    // doesn't drop the window.
+    let routed = match action {
+        Some(RuleAction::Workspace(n)) => {
+            let target = WorkspaceId(n);
+            if wm.workspaces.contains_key(&target) {
+                Some(target)
+            } else {
+                tracing::warn!(
+                    workspace = n,
+                    exe = %exe,
+                    class = %class,
+                    "rule routes to nonexistent workspace; falling back to default placement"
+                );
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let manage_result = match routed {
+        Some(target) => wm.manage_routed(id, title, class.clone(), exe.clone(), target),
+        None => wm.manage(id, title, class.clone(), exe.clone()),
+    };
+    if manage_result.is_err() {
         return false;
     }
 
-    // Apply rule-driven follow-ups.
-    if let Some(action) = first_matching_action(win, &class, rules) {
+    // Apply rule-driven mode follow-ups. `Workspace` is a placement-only
+    // action; the window stays in its default Tiled mode. `Ignore` is
+    // already filtered out by `is_manageable`.
+    if let Some(action) = action {
         match action {
             RuleAction::Float => {
-                let _ = wm.toggle_float(); // marks as floating + retiles
+                // toggle_float operates on the focused window. For routed
+                // windows that didn't take focus, we'd need a target-id
+                // version; for v1 we only honour `float` when the window
+                // is on the focused workspace (the common case). Skip
+                // silently otherwise so the rule doesn't float something
+                // on a different workspace than the user is looking at.
+                if wm.focused_window == Some(id) {
+                    let _ = wm.toggle_float();
+                }
             }
             RuleAction::Tile => {
                 let is_floating = wm
@@ -112,9 +162,12 @@ pub fn admit(wm: &mut WindowManager, rules: &[Rule], win: dwmend_platform::windo
                     .get(&id)
                     .map(|mw| matches!(mw.mode, WindowMode::Floating))
                     .unwrap_or(false);
-                if is_floating {
+                if is_floating && wm.focused_window == Some(id) {
                     let _ = wm.toggle_float();
                 }
+            }
+            RuleAction::Workspace(_) => {
+                // Already handled above — placement only.
             }
             RuleAction::Ignore => unreachable!(), // filtered above
         }

@@ -40,6 +40,30 @@ type NodeIdx = u32;
 
 const NONE: NodeIdx = u32::MAX;
 
+/// How `insert` chooses the split axis when a new window enters the tree.
+///
+/// * **Dwindle** \u2014 default i3 / Hyprland behaviour. The split axis is
+///   driven by the focused leaf's aspect ratio: wider rects split
+///   vertically, taller rects split horizontally. Visually this produces
+///   a chain of progressively smaller halves down the right (or bottom)
+///   edge, hence "dwindle".
+/// * **Spiral** \u2014 fixed alternation: each new split flips the axis of
+///   the parent split. From a single window the first split is vertical;
+///   the next split (added on either side) is horizontal; and so on.
+///   This yields a spiral pattern that winds inward and is the canonical
+///   alternative offered by every other BSP tiler.
+///
+/// Both modes share the same insertion mechanics \u2014 only the `axis`
+/// decision differs \u2014 so users can flip per-workspace at runtime
+/// without a tree rebuild. The new policy applies to subsequent inserts
+/// only; existing splits keep their axes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LayoutMode {
+    #[default]
+    Dwindle,
+    Spiral,
+}
+
 #[derive(Debug, Clone)]
 enum NodeKind<T> {
     Leaf {
@@ -73,6 +97,9 @@ pub struct BspTree<T: Copy + Eq + Hash> {
     focus: NodeIdx,
     /// `leaf` → idx lookup for O(1) finds.
     index_of: HashMap<T, NodeIdx>,
+    /// How `insert` chooses the split axis. See [`LayoutMode`] for the
+    /// semantics; runtime swaps via [`Self::set_layout_mode`].
+    mode: LayoutMode,
 }
 
 impl<T: Copy + Eq + Hash> Default for BspTree<T> {
@@ -83,6 +110,7 @@ impl<T: Copy + Eq + Hash> Default for BspTree<T> {
             root: NONE,
             focus: NONE,
             index_of: HashMap::new(),
+            mode: LayoutMode::default(),
         }
     }
 }
@@ -90,6 +118,19 @@ impl<T: Copy + Eq + Hash> Default for BspTree<T> {
 impl<T: Copy + Eq + Hash> BspTree<T> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read the current layout mode \u2014 see [`LayoutMode`].
+    pub fn layout_mode(&self) -> LayoutMode {
+        self.mode
+    }
+
+    /// Replace the layout mode. Affects future inserts only; existing
+    /// splits retain their axes so toggling never reflows the workspace
+    /// (matching i3's `layout` semantics: it's a "what comes next?"
+    /// switch, not a destructive remap).
+    pub fn set_layout_mode(&mut self, mode: LayoutMode) {
+        self.mode = mode;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -273,10 +314,43 @@ impl<T: Copy + Eq + Hash> BspTree<T> {
         // sensible default axis.
         let focused = focus_idx;
         let focused_rect = self.leaf_rect(focused, work_area).unwrap_or(work_area);
-        let axis = if focused_rect.w >= focused_rect.h {
-            Axis::Vertical // wide → split into left + right
-        } else {
-            Axis::Horizontal // tall → split into top + bottom
+        let axis = match self.mode {
+            LayoutMode::Dwindle => {
+                // Dwindle: aspect-ratio driven. Wide rects split into
+                // left|right, tall rects into top/bottom.
+                if focused_rect.w >= focused_rect.h {
+                    Axis::Vertical
+                } else {
+                    Axis::Horizontal
+                }
+            }
+            LayoutMode::Spiral => {
+                // Spiral: alternate from the parent split's axis. The
+                // first split (focused leaf is the root) has no parent,
+                // so we fall back to aspect-ratio so the very first
+                // window pair still looks reasonable.
+                let parent_idx = self.nodes[focused as usize].parent;
+                if parent_idx == NONE {
+                    if focused_rect.w >= focused_rect.h {
+                        Axis::Vertical
+                    } else {
+                        Axis::Horizontal
+                    }
+                } else if let NodeKind::Split { axis, .. } =
+                    self.nodes[parent_idx as usize].kind
+                {
+                    axis.flip()
+                } else {
+                    // Parent is a Stack \u2014 we already early-returned for
+                    // stack focuses above; this branch is unreachable in
+                    // practice but a safe fallback keeps the match total.
+                    if focused_rect.w >= focused_rect.h {
+                        Axis::Vertical
+                    } else {
+                        Axis::Horizontal
+                    }
+                }
+            }
         };
 
         // Materialise the new leaf.
@@ -1109,6 +1183,62 @@ mod tests {
         assert_eq!(r2.h, 1080);
         // They tile exactly with no gap.
         assert_eq!(r1.right(), r2.left());
+    }
+
+    #[test]
+    fn spiral_alternates_split_axis() {
+        // Spiral: each new split flips the parent split's axis. Starting
+        // from a wide work area the first split is vertical (parent
+        // doesn't exist; aspect-ratio fallback). The second insert
+        // splits w2's parent (vertical) into a horizontal child, so
+        // w2 and w3 share the right column.
+        let mut t = BspTree::<u32>::new();
+        t.set_layout_mode(LayoutMode::Spiral);
+        for i in 1..=3 {
+            t.insert(i, fhd());
+        }
+        let pos = t.compute(fhd(), 0);
+        let r1 = pos.iter().find(|(w, _)| *w == 1).unwrap().1;
+        let r2 = pos.iter().find(|(w, _)| *w == 2).unwrap().1;
+        let r3 = pos.iter().find(|(w, _)| *w == 3).unwrap().1;
+        // w1 occupies the left half (vertical split first).
+        assert_eq!(r1.x, 0);
+        assert_eq!(r1.w, 960);
+        // w2 and w3 split the right half horizontally (axis flipped
+        // from the vertical parent), so they share x and width.
+        assert_eq!(r2.x, 960);
+        assert_eq!(r3.x, 960);
+        assert_eq!(r2.w, 960);
+        assert_eq!(r3.w, 960);
+        // And their heights stack together to fill the right column.
+        assert_eq!(r2.h + r3.h, 1080);
+    }
+
+    #[test]
+    fn spiral_four_windows_no_overlap() {
+        // Sanity check: 4 inserts in spiral mode still cover the full
+        // work area without overlap (each leaf rect is unique).
+        let mut t = BspTree::<u32>::new();
+        t.set_layout_mode(LayoutMode::Spiral);
+        for i in 1..=4 {
+            t.insert(i, fhd());
+        }
+        let pos = t.compute(fhd(), 0);
+        assert_eq!(pos.len(), 4);
+        let total: i64 = pos.iter().map(|(_, r)| r.area()).sum();
+        assert_eq!(total, fhd().area());
+        let unique: std::collections::HashSet<_> = pos.iter().map(|(_, r)| *r).collect();
+        assert_eq!(unique.len(), 4);
+    }
+
+    #[test]
+    fn layout_mode_round_trip() {
+        let mut t = BspTree::<u32>::new();
+        assert_eq!(t.layout_mode(), LayoutMode::Dwindle); // default
+        t.set_layout_mode(LayoutMode::Spiral);
+        assert_eq!(t.layout_mode(), LayoutMode::Spiral);
+        t.set_layout_mode(LayoutMode::Dwindle);
+        assert_eq!(t.layout_mode(), LayoutMode::Dwindle);
     }
 
     #[test]

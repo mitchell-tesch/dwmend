@@ -254,8 +254,47 @@ impl WindowManager {
         if self.windows.contains_key(&id) {
             return Ok(()); // already managed
         }
+        let ws_id = self.default_admit_workspace(id)?;
+        self.manage_on(id, title, class, exe_name, ws_id, true)
+    }
 
-        // Decide which workspace this window belongs on.
+    /// Admit a window onto a *specific* workspace without taking the
+    /// user's focus along with it.
+    ///
+    /// Used by `[[rules]]` with `action = "workspace"`: a rule-routed app
+    /// should land on its assigned workspace silently, leaving the user on
+    /// whatever workspace they were already using. If the target workspace
+    /// is hidden, the window is hidden too (`SW_HIDE`); if it's visible on
+    /// another monitor, the window appears there but focus stays put.
+    ///
+    /// When the target workspace is already the focused one, we delegate
+    /// to the standard focus-stealing path so behaviour matches an
+    /// unrouted admit on the same workspace (no surprise "didn't focus
+    /// even though I'm right here").
+    pub fn manage_routed(
+        &mut self,
+        id: WindowId,
+        title: String,
+        class: String,
+        exe_name: String,
+        target: WorkspaceId,
+    ) -> Result<()> {
+        if self.windows.contains_key(&id) {
+            return Ok(());
+        }
+        if !self.workspaces.contains_key(&target) {
+            return Err(eyre!(
+                "rule routed window to workspace {} which does not exist",
+                target.0
+            ));
+        }
+        let take_focus = self.focused_workspace_id() == Some(target);
+        self.manage_on(id, title, class, exe_name, target, take_focus)
+    }
+
+    /// Decide the workspace a freshly-admitted window should land on when
+    /// no `[[rules]]` override is in play.
+    fn default_admit_workspace(&self, id: WindowId) -> Result<WorkspaceId> {
         let win = dwmend_platform::window::Window(id.0);
         let host_monitor = win
             .rect()
@@ -265,7 +304,7 @@ impl WindowManager {
         // "Primary then focused" matters when the focused monitor is a smaller
         // secondary display — we want orphan windows on the user's main screen,
         // not piling onto whatever the BTreeMap happened to put first.
-        let ws_id = host_monitor
+        host_monitor
             .as_ref()
             .and_then(|mid| self.monitors.get(mid).map(|m| m.current_workspace))
             .or_else(|| {
@@ -275,7 +314,27 @@ impl WindowManager {
                     .map(|m| m.current_workspace)
             })
             .or_else(|| self.focused_workspace_id())
-            .ok_or_else(|| eyre!("no workspace available to host new window"))?;
+            .ok_or_else(|| eyre!("no workspace available to host new window"))
+    }
+
+    /// Insert a managed-window record on `ws_id`.
+    ///
+    /// `take_focus = true` keeps the long-standing behaviour of focusing
+    /// the new window (used by every default admit). `take_focus = false`
+    /// is the rule-routing path: insert silently, hide the window if the
+    /// target workspace is currently in the pool, and leave the focus
+    /// pointers alone so the user doesn't yo-yo between workspaces every
+    /// time a routed app launches.
+    fn manage_on(
+        &mut self,
+        id: WindowId,
+        title: String,
+        class: String,
+        exe_name: String,
+        ws_id: WorkspaceId,
+        take_focus: bool,
+    ) -> Result<()> {
+        let win = dwmend_platform::window::Window(id.0);
 
         tracing::debug!(
             hwnd = %format!("{:#x}", id.0),
@@ -283,12 +342,29 @@ impl WindowManager {
             class = %class,
             title = %title,
             workspace = ws_id.0,
-            host_monitor = ?host_monitor.as_ref().map(|m| &m.0),
+            take_focus,
             "managing window"
         );
 
         // Always disable transitions on first encounter — the smoothness lever.
         let _ = win.disable_transitions();
+
+        let target_visible = self
+            .workspaces
+            .get(&ws_id)
+            .is_some_and(|w| w.is_visible());
+
+        // If we're routing to a hidden workspace, hide the HWND so it
+        // doesn't keep showing on whatever monitor the OS placed it on.
+        // We mark `hidden_by_us` so the WinEvent listener doesn't treat
+        // our own hide as a tray-minimise from the app.
+        let hidden_by_us = !target_visible;
+        if hidden_by_us
+            && let Err(e) = win.hide()
+        {
+            tracing::warn!(hwnd = %format!("{:#x}", id.0), error = %e,
+                "hide failed during routed admit; window may stay visible");
+        }
 
         self.windows.insert(
             id,
@@ -299,7 +375,7 @@ impl WindowManager {
                 title,
                 class,
                 exe_name,
-                hidden_by_us: false,
+                hidden_by_us,
             },
         );
 
@@ -307,8 +383,11 @@ impl WindowManager {
         if let Some(ws) = self.workspaces.get_mut(&ws_id) {
             ws.tree.insert(id, work_area);
         }
-        self.apply_focus_borders(Some(id));
-        self.focused_window = Some(id);
+
+        if take_focus {
+            self.apply_focus_borders(Some(id));
+            self.focused_window = Some(id);
+        }
         self.retile_workspace(ws_id)
     }
 

@@ -146,6 +146,17 @@ impl WindowManager {
         Ok(())
     }
 
+    /// Apply `mode` to every workspace's BSP tree. Used at startup and on
+    /// config reload so the configured layout takes effect everywhere.
+    /// Runtime per-workspace toggles via [`Self::toggle_layout_mode`]
+    /// will be reset by the next reload \u2014 same semantics i3 / Hyprland
+    /// expose for their layout flags.
+    pub fn apply_layout_mode_all(&mut self, mode: dwmend_layout::bsp::LayoutMode) {
+        for ws in self.workspaces.values_mut() {
+            ws.tree.set_layout_mode(mode);
+        }
+    }
+
     /// Restore visibility of every window DWMend ever hid. Called from the
     /// ctrl-c / quit path and from `dwmend.exe restore`.
     pub fn restore_all_managed_windows(&mut self) {

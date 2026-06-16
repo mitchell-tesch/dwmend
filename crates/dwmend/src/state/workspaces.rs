@@ -66,6 +66,34 @@ impl WindowManager {
         }
     }
 
+    /// Bring `target` to a SPECIFIC monitor rather than the focused one.
+    ///
+    /// Used by bar-pill clicks: a click on monitor B's bar should bring
+    /// the requested workspace to monitor B even if the user's keyboard
+    /// focus is currently on monitor A.
+    ///
+    /// Implemented by temporarily redirecting `focused_monitor` to the
+    /// target and delegating to [`switch_workspace`], which already
+    /// handles the "already visible elsewhere" / "currently hidden" /
+    /// "no-op" cases. The focus shift survives the call so the user's
+    /// keyboard focus follows their click \u2014 matching how clicking on a
+    /// monitor in Windows itself focuses that display.
+    pub fn switch_workspace_on_monitor(
+        &mut self,
+        target: WorkspaceId,
+        clicked_mid: MonitorId,
+    ) -> Result<()> {
+        if !self.monitors.contains_key(&clicked_mid) {
+            return Err(eyre!(
+                "switch_workspace_on_monitor: monitor `{}` not present",
+                clicked_mid.0
+            ));
+        }
+        self.focused_monitor = Some(clicked_mid);
+        self.switch_workspace(target)
+    }
+
+
     pub(super) fn swap_workspace_onto_monitor(
         &mut self,
         mid: &MonitorId,
