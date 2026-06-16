@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dwmend",
+    "crates/dwmend-platform",
+    "crates/dwmend-layout",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+authors = ["Mitchell Tesch"]
+description = "A tiling window manager for Windows 11."
+repository = "https://github.com/mitchell-tesch/dwmend"
+homepage = "https://github.com/mitchell-tesch/dwmend"
+readme = "README.md"
+keywords = ["windows", "tiling", "window-manager", "wm", "dwm"]
+categories = ["os::windows-apis", "gui", "command-line-utilities"]
+
+[workspace.dependencies]
+dwmend-platform = { path = "crates/dwmend-platform" }
+dwmend-layout = { path = "crates/dwmend-layout" }
+
+# Win32 / WinRT — single, well-known stable line
+windows = "0.62"
+
+# Concurrency / sync
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+# Errors / logging
+color-eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Config + watcher
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+notify = "8"
+
+# Misc daemon glue
+ctrlc = { version = "3", features = ["termination"] }
+regex = "1"
+bitflags = "2"
+dirs = "6"
+serde_json = "1"
+
+# build-dep
+embed-resource = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+opt-level = 3
+
+[profile.dev]
+opt-level = 1   # keep window-move math snappy even in debug

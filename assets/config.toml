@@ -1,0 +1,144 @@
+# Default DWMend config — emitted to %APPDATA%\dwmend\config.toml on first run.
+# Edit and save to apply (config is hot-reloaded).
+
+[general]
+# Pixel gap between adjacent tiles.
+gap = 8
+# Reserved space (work-area inset) per side.
+outer_gap_top    = 0
+outer_gap_right  = 0
+outer_gap_bottom = 0
+outer_gap_left   = 0
+# Number of pre-created workspaces.
+workspace_count = 10
+# When switching to a workspace already shown on another monitor:
+#   "swap"                -> swap workspaces between the two monitors so
+#                            the requested workspace comes to the focused
+#                            monitor (recommended for multi-monitor setups)
+#   "focus_other_monitor" -> just focus the other monitor.
+on_workspace_already_visible = "swap"
+
+# Color of the focused-window highlight overlay frame, as #RRGGBB.
+focused_border_color   = "#4FC3F7"
+# Thickness in pixels of the focused-window highlight overlay drawn around
+# the active tile. 0 disables the overlay entirely.
+# Recommended values: 3-6 px.
+border_width = 3
+# Inner corner radius of the focus highlight, in pixels. 8 matches the
+# Windows 11 DWM rounding so the overlay frame follows each window's curve.
+# Use 0 for sharp rectangular corners.
+corner_radius = 8
+# Show a thin status bar at the top of each monitor with workspace numbers,
+# focused window title and pause indicator. Set false to disable.
+bar_enabled = true
+
+[keybindings]
+# Modifier names accepted: "SUPER" (Win), "ALT", "CTRL", "SHIFT".
+#
+# The below defaults use the 'ALT' modifier i.e. `ALT+...`
+# When DWMend registers an Alt combo via `RegisterHotKey`
+# the OS gives DWMend the keystroke first and suppresses the app's menu
+# mnemonic, so `ALT+F` opens a tile-related action rather than the File
+# menu. (If a binding still fails because something else has already
+# claimed it, you'll see a "Hot key is already registered" warning at
+# startup and that one binding will silently no-op.)
+#
+# Action grammar:
+#   focus <left|right|up|down>
+#   move  <left|right|up|down>
+#   resize <left|right|up|down> <delta_px>
+#   workspace <N>            (switch to workspace N)
+#   move_to_workspace <N>    (move focused window to workspace N)
+#   focus_monitor  <left|right|up|down>
+#   toggle_float
+#   toggle_monocle
+#   toggle_stack             (smart: merges focused tile with its BSP sibling
+#                              if the sibling is a Leaf or Stack; falls back
+#                              to a 1-member stack when the sibling is a
+#                              subtree or there is no sibling)
+#   stack_swallow <left|right|up|down>
+#                            (pull the neighbour in <dir> into the focused tile's
+#                              stack; useful when toggle_stack chose the wrong
+#                              neighbour or you want to grow an existing stack)
+#   stack_pop                (extract the focused stack member back into its
+#                              own tile via a fresh vertical split)
+#   focus_stack_next         (cycle forward through the focused stack)
+#   focus_stack_prev         (cycle backward through the focused stack)
+#   close
+#   toggle_pause
+#   reload_config
+#   quit
+
+# Focus the next tile (vim key default).
+"ALT+H" = "focus left"
+"ALT+J" = "focus down"
+"ALT+K" = "focus up"
+"ALT+L" = "focus right"
+
+# Move the focused tile.
+"ALT+SHIFT+H" = "move left"
+"ALT+SHIFT+J" = "move down"
+"ALT+SHIFT+K" = "move up"
+"ALT+SHIFT+L" = "move right"
+
+# Resize (32 px per press).
+"ALT+CTRL+H" = "resize left 32"
+"ALT+CTRL+J" = "resize down 32"
+"ALT+CTRL+K" = "resize up 32"
+"ALT+CTRL+L" = "resize right 32"
+
+# Workspaces 1..10.
+"ALT+1" = "workspace 1"
+"ALT+2" = "workspace 2"
+"ALT+3" = "workspace 3"
+"ALT+4" = "workspace 4"
+"ALT+5" = "workspace 5"
+"ALT+6" = "workspace 6"
+"ALT+7" = "workspace 7"
+"ALT+8" = "workspace 8"
+"ALT+9" = "workspace 9"
+"ALT+0" = "workspace 10"
+
+"ALT+SHIFT+1" = "move_to_workspace 1"
+"ALT+SHIFT+2" = "move_to_workspace 2"
+"ALT+SHIFT+3" = "move_to_workspace 3"
+"ALT+SHIFT+4" = "move_to_workspace 4"
+"ALT+SHIFT+5" = "move_to_workspace 5"
+"ALT+SHIFT+6" = "move_to_workspace 6"
+"ALT+SHIFT+7" = "move_to_workspace 7"
+"ALT+SHIFT+8" = "move_to_workspace 8"
+"ALT+SHIFT+9" = "move_to_workspace 9"
+"ALT+SHIFT+0" = "move_to_workspace 10"
+
+# Window mode toggles.
+"ALT+T" = "toggle_float"
+"ALT+F" = "toggle_monocle"
+"ALT+W" = "close"
+
+# Stack containers — multiple windows sharing one tile.
+# `ALT+G` is smart: with two tiles side-by-side it merges them
+# into a single stack on the first press. `[` and `]` cycle the visible
+# member. `ALT+SHIFT+G` (stack_pop) extracts the focused member back out
+# into its own tile.
+"ALT+G"       = "toggle_stack"
+"ALT+SHIFT+G" = "stack_pop"
+"ALT+]"       = "focus_stack_next"
+"ALT+["       = "focus_stack_prev"
+
+# Daemon control.
+"ALT+P"       = "toggle_pause"
+"ALT+SHIFT+R" = "reload_config"
+"ALT+SHIFT+Q" = "quit"
+
+# Rules are matched in order; first match wins.
+# Match keys: exe (basename, equals), class (regex), title (regex).
+# Action keys: action ("ignore" | "float" | "tile"), workspace (1..N)
+
+[[rules]]
+match.exe = "Spotify.exe"
+action    = "ignore"
+
+[[rules]]
+match.class = "Chrome_WidgetWin_1"
+match.title = ".*Picture.in.Picture.*"
+action      = "float"

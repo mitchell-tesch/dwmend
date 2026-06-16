@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DWMend icon — a 4-tile dwindle / BSP layout, mimicking the four-pane
+  Windows logo but produced by asymmetric recursive splits (the same way
+  the daemon itself lays out windows).
+
+  Splits, in order:
+    1) Vertical 50/50          -> Tile 1 takes the left half.
+    2) Right side, horizontal  -> Tile 2 takes the upper right.
+    3) Lower right, vertical   -> Tiles 3 and 4 share the bottom right.
+
+  Canvas 256x256 with a 16 px outer margin and an 8 px gutter — that 8 px
+  matches the default `gap = 8` in assets/config.toml, so the icon visually
+  reflects what the WM actually produces with default settings.
+
+  Brand colour #4FC3F7 = the default `focused_border_color`.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <g fill="#4FC3F7">
+    <!-- Tile 1 — left half (after V-split). -->
+    <rect x="16"  y="16"  width="108" height="224" rx="20" ry="20" />
+    <!-- Tile 2 — upper right (after H-split of right half). -->
+    <rect x="132" y="16"  width="108" height="108" rx="20" ry="20" />
+    <!-- Tile 3 — lower-right left (after V-split of bottom right). -->
+    <rect x="132" y="132" width="50"  height="108" rx="14" ry="14" />
+    <!-- Tile 4 — lower-right right. -->
+    <rect x="190" y="132" width="50"  height="108" rx="14" ry="14" />
+  </g>
+</svg>
