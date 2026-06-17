@@ -7,13 +7,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 publish = false
 authors = ["Mitchell Tesch"]
-description = "A tiling window manager for Windows 11."
+description = "DWMend tiling window manager."
 repository = "https://github.com/mitchell-tesch/dwmend"
 homepage = "https://github.com/mitchell-tesch/dwmend"
 readme = "README.md"
