@@ -233,6 +233,15 @@ impl WindowManager {
                 },
             );
         }
+
+        // Tell the toast subsystem which monitor to drop default-routed
+        // toasts on. Done here (rather than inside every focus mutator)
+        // because every focus change funnels through publish_bar_state
+        // anyway, so this single line covers all paths without
+        // duplicating the lookup.
+        if let Some(mid) = &self.focused_monitor {
+            crate::ui::toast::set_default_monitor(mid.0.clone());
+        }
     }
 
     // ---- manage / unmanage ----------------------------------------------

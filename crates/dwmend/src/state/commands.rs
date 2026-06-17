@@ -203,8 +203,20 @@ impl WindowManager {
                 LayoutMode::Spiral => LayoutMode::Dwindle,
             };
             ws.tree.set_layout_mode(new_mode);
-            tracing::info!(workspace = ws_id.0, mode = ?new_mode, "layout mode toggled");
-        }
+            tracing::info!(workspace = ws_id.0, mode = ?new_mode, "layout mode toggled");            // Surface the change as a quick toast so the user gets
+            // feedback even when the action is invisible (no existing
+            // tile reflows) until the next insert.
+            crate::ui::toast::show(
+                crate::ui::toast::ToastLevel::Info,
+                format!(
+                    "Layout: {} (ws {})",
+                    match new_mode {
+                        LayoutMode::Dwindle => "dwindle",
+                        LayoutMode::Spiral => "spiral",
+                    },
+                    ws_id.0
+                ),
+            );        }
         Ok(())
     }
 

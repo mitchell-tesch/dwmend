@@ -24,6 +24,10 @@ pub struct Config {
     /// All fields default to the v0.1 hard-coded values, so omitting
     /// the `[bar]` section keeps the previous look exactly.
     pub bar: Bar,
+    /// Notification toast subsystem. Defaults match the built-in
+    /// [`dwmend::ui::toast::ToastConfig::default`] so omitting this
+    /// section keeps the previously hard-coded behaviour.
+    pub notifications: Notifications,
     /// Raw "key combo string" → "action string" map.
     /// Parsed into hotkey table in `hotkey.rs`.
     pub keybindings: HashMap<String, String>,
@@ -176,6 +180,80 @@ impl Default for BarColorsConfig {
             active_fg: "#101018".to_string(),
             visible_outline: "#808080".to_string(),
             dim_fg: "#606060".to_string(),
+        }
+    }
+}
+
+/// Notification toast subsystem settings. Mirrors the runtime shape of
+/// [`dwmend::ui::toast::ToastConfig`] in TOML so the daemon can hot-
+/// reload the whole struct without restarting the listener thread.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct Notifications {
+    /// Master switch. When `false`, every `notify` call (hotkey or
+    /// IPC) becomes a silent no-op and existing log lines remain the
+    /// only feedback. The listener thread stays alive so flipping
+    /// this back to `true` via reload re-enables toasts immediately.
+    pub enabled: bool,
+    /// Hold-phase duration in milliseconds. The fade-in (~150 ms) and
+    /// fade-out (~200 ms) are fixed and added on top, so a `ttl_ms`
+    /// of 2200 gives a total visible lifetime of ~2.55 s.
+    pub ttl_ms: u32,
+    /// Maximum concurrent toasts on a single monitor. Beyond this,
+    /// the oldest active toast is forced into fade-out.
+    pub max_concurrent: u32,
+    /// Stack anchor corner. Currently only `"top_right"` is wired up;
+    /// other corners may be added without breaking older configs.
+    pub anchor: NotificationAnchor,
+    /// Severity colour palette.
+    pub colors: NotificationColors,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_ms: 2200,
+            max_concurrent: 3,
+            anchor: NotificationAnchor::TopRight,
+            colors: NotificationColors::default(),
+        }
+    }
+}
+
+/// TOML-facing toast anchor selector. Mapped onto
+/// [`dwmend::ui::toast::ToastAnchor`] in `daemon.rs`.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationAnchor {
+    #[default]
+    TopRight,
+}
+
+/// `[notifications.colors]` sub-table. Each value is a `"#RRGGBB"`
+/// string parsed at apply time. The defaults give info=sky-blue,
+/// warn=amber, error=red, all with text colours that contrast against
+/// the fill.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct NotificationColors {
+    pub info_bg: String,
+    pub info_fg: String,
+    pub warn_bg: String,
+    pub warn_fg: String,
+    pub error_bg: String,
+    pub error_fg: String,
+}
+
+impl Default for NotificationColors {
+    fn default() -> Self {
+        Self {
+            info_bg: "#4FC3F7".to_string(),
+            info_fg: "#101018".to_string(),
+            warn_bg: "#F9A825".to_string(),
+            warn_fg: "#101018".to_string(),
+            error_bg: "#E53935".to_string(),
+            error_fg: "#FFFFFF".to_string(),
         }
     }
 }

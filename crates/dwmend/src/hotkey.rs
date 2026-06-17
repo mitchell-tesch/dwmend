@@ -236,6 +236,38 @@ pub fn parse_action(s: &str) -> Result<Command> {
         "toggle_pause" => Ok(Command::TogglePause),
         "reload_config" => Ok(Command::ReloadConfig),
         "quit" => Ok(Command::Quit),
+        "notify" => {
+            // Grammar: `notify <level> <text...>`. The level is one
+            // word; the text is everything after \u2014 we can't lean on
+            // `split_whitespace` because user messages routinely
+            // contain spaces ("Build complete in 3.2s").
+            //
+            // Re-find the level + text by peeling the first two tokens
+            // off `s` directly. The first token is `notify` itself,
+            // already consumed via `verb`.
+            let after_verb = s.trim_start().strip_prefix("notify").unwrap_or("").trim_start();
+            let (level_tok, text) = match after_verb.find(char::is_whitespace) {
+                Some(i) => (&after_verb[..i], after_verb[i..].trim()),
+                None => (after_verb, ""),
+            };
+            if level_tok.is_empty() {
+                return Err(eyre!("notify: missing level (info|warn|error)"));
+            }
+            let level = match level_tok.to_ascii_lowercase().as_str() {
+                "info" => crate::ui::toast::ToastLevel::Info,
+                "warn" | "warning" => crate::ui::toast::ToastLevel::Warn,
+                "error" | "err" => crate::ui::toast::ToastLevel::Error,
+                other => return Err(eyre!("notify: unknown level `{other}`")),
+            };
+            if text.is_empty() {
+                return Err(eyre!("notify: missing message text"));
+            }
+            // Strip surrounding single or double quotes \u2014 lets users
+            // write `cmd "notify info 'Hello world'"` from PowerShell
+            // without the quotes leaking into the toast.
+            let trimmed = text.trim_matches(|c: char| c == '"' || c == '\'');
+            Ok(Command::Notify(level, trimmed.to_string()))
+        }
         other => Err(eyre!("unknown action `{other}`")),
     }
 }
@@ -401,5 +433,54 @@ mod tests {
     #[test]
     fn parse_workspace_errors_on_missing_number() {
         assert!(parse_action("workspace").is_err());
+    }
+
+    #[test]
+    fn parse_notify_basic() {
+        match parse_action("notify info Hello there").unwrap() {
+            Command::Notify(crate::ui::toast::ToastLevel::Info, text) => {
+                assert_eq!(text, "Hello there");
+            }
+            other => panic!("expected Notify(Info, ...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_notify_strips_quotes() {
+        match parse_action(r#"notify warn "Build broken""#).unwrap() {
+            Command::Notify(crate::ui::toast::ToastLevel::Warn, text) => {
+                assert_eq!(text, "Build broken");
+            }
+            other => panic!("expected Notify(Warn, ...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_notify_levels_are_case_insensitive() {
+        let a = parse_action("notify INFO hi").unwrap();
+        let b = parse_action("notify info hi").unwrap();
+        let c = parse_action("notify Warning hi").unwrap();
+        assert!(matches!(
+            a,
+            Command::Notify(crate::ui::toast::ToastLevel::Info, _)
+        ));
+        assert!(matches!(
+            b,
+            Command::Notify(crate::ui::toast::ToastLevel::Info, _)
+        ));
+        assert!(matches!(
+            c,
+            Command::Notify(crate::ui::toast::ToastLevel::Warn, _)
+        ));
+    }
+
+    #[test]
+    fn parse_notify_rejects_unknown_level() {
+        assert!(parse_action("notify oops some text").is_err());
+    }
+
+    #[test]
+    fn parse_notify_rejects_missing_text() {
+        assert!(parse_action("notify info").is_err());
     }
 }

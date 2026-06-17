@@ -189,6 +189,15 @@ pub fn run_daemon() -> Result<()> {
         }
     }
 
+    // ---- notifications --------------------------------------------------
+    // Failure is non-fatal: a missing toast subsystem only loses the
+    // pop-up feedback; everything still logs as before.
+    let toast_cfg = parse_toast_config(&cfg.notifications);
+    let toast_specs = build_toast_specs(&monitor_infos, bar_height);
+    if let Err(e) = ui::toast::start(toast_specs, toast_cfg) {
+        tracing::warn!(error = %e, "toast subsystem init failed; logs are the only feedback");
+    }
+
     // ---- tray icon ------------------------------------------------------
     // Failure is non-fatal — explorer.exe may not be running yet at boot,
     // or the user may have disabled notification icons entirely. Either
@@ -343,6 +352,10 @@ pub fn run_daemon() -> Result<()> {
                         continue;
                     }
                 };
+                // Resync the toast subsystem to the new topology BEFORE
+                // the WM lock is taken so toasts emitted during the
+                // reconcile can target the correct monitor list.
+                ui::toast::sync_monitors(build_toast_specs(&infos, bar_height));
                 let mut wm = wm.lock();
                 if let Err(e) = wm.reconcile_monitors(infos) {
                     tracing::warn!(error = %e, "reconcile_monitors failed");
@@ -392,17 +405,26 @@ pub fn run_daemon() -> Result<()> {
                                             new_router.table.clone(),
                                         ) {
                                             Ok(()) => {
+                                                let n = new_router.id_to_command.len();
                                                 router = new_router;
                                                 original_keybindings = new_cfg.keybindings.clone();
                                                 tracing::info!(
-                                                    count = router.id_to_command.len(),
+                                                    count = n,
                                                     "keybindings hot-reloaded"
+                                                );
+                                                ui::toast::show(
+                                                    ui::toast::ToastLevel::Info,
+                                                    format!("Bindings reloaded ({n})"),
                                                 );
                                             }
                                             Err(e) => {
                                                 tracing::error!(error = %e,
                                                     "keybinding hot-reload failed; \
                                                      old bindings still active");
+                                                ui::toast::show(
+                                                    ui::toast::ToastLevel::Error,
+                                                    "Keybinding reload failed".to_string(),
+                                                );
                                             }
                                         }
                                     }
@@ -420,6 +442,10 @@ pub fn run_daemon() -> Result<()> {
                                         tracing::warn!(
                                             old = original_bar_height, new = new_bar_h,
                                             "bar height change detected; restart dwmend to apply"
+                                        );
+                                        ui::toast::show(
+                                            ui::toast::ToastLevel::Warn,
+                                            "Bar height changed; restart to apply".to_string(),
                                         );
                                     }
                                     rules = new_rules;
@@ -442,15 +468,38 @@ pub fn run_daemon() -> Result<()> {
                                     // Bar theme + segments are hot-reloadable.
                                     ui::bar::set_colors(parse_bar_colors(&new_cfg.bar));
                                     ui::bar::set_segments(bar_segments_from_cfg(&new_cfg.bar));
+                                    // Toast subsystem: colours, TTL,
+                                    // concurrency cap, and the
+                                    // master `enabled` switch flow
+                                    // straight through. In-flight
+                                    // toasts complete with the
+                                    // values they were spawned under.
+                                    ui::toast::set_config(parse_toast_config(&new_cfg.notifications));
                                     wm.on_already_visible =
                                         new_cfg.general.on_workspace_already_visible.into();
                                     let _ = wm.retile_all();
                                     wm.publish_bar_state();
                                     tracing::info!("config reloaded");
+                                    ui::toast::show(
+                                        ui::toast::ToastLevel::Info,
+                                        "Config reloaded".to_string(),
+                                    );
                                 }
-                                Err(e) => tracing::error!(error = %e, "bad rules; keeping old"),
+                                Err(e) => {
+                                    tracing::error!(error = %e, "bad rules; keeping old");
+                                    ui::toast::show(
+                                        ui::toast::ToastLevel::Error,
+                                        format!("Config rejected: {e}"),
+                                    );
+                                }
                             },
-                            Err(e) => tracing::error!(error = %e, "config reload failed"),
+                            Err(e) => {
+                                tracing::error!(error = %e, "config reload failed");
+                                ui::toast::show(
+                                    ui::toast::ToastLevel::Error,
+                                    format!("Config reload failed: {e}"),
+                                );
+                            }
                         }
                     }
                     Command::Reap => {
@@ -507,6 +556,7 @@ pub fn run_daemon() -> Result<()> {
     }
     dwmend_platform::focus_border::stop();
     ui::bar::stop();
+    ui::toast::stop();
     ui::tray::stop();
     dwmend_platform::keyboard::stop();
     dwmend_platform::winevent::stop();
@@ -589,4 +639,60 @@ fn map_layout(k: config::LayoutKind) -> dwmend_layout::bsp::LayoutMode {
         config::LayoutKind::Dwindle => dwmend_layout::bsp::LayoutMode::Dwindle,
         config::LayoutKind::Spiral => dwmend_layout::bsp::LayoutMode::Spiral,
     }
+}
+/// Build a `ToastConfig` from the `[notifications]` config table.
+/// Bad colour strings fall back to the toast subsystem's defaults
+/// with a per-field warning so a typo never blocks startup.
+fn parse_toast_config(cfg: &config::Notifications) -> ui::toast::ToastConfig {
+    let defaults = ui::toast::ToastColors::default();
+    let parse = |name: &str, s: &str, fallback: u32| {
+        config::parse_border_color(s).unwrap_or_else(|e| {
+            tracing::warn!(field = name, value = s, error = %e,
+                "bad notifications color; using default");
+            fallback
+        })
+    };
+    ui::toast::ToastConfig {
+        enabled: cfg.enabled,
+        ttl_ms: cfg.ttl_ms,
+        max_concurrent: cfg.max_concurrent.max(1),
+        anchor: match cfg.anchor {
+            config::NotificationAnchor::TopRight => ui::toast::ToastAnchor::TopRight,
+        },
+        colors: ui::toast::ToastColors {
+            info_bg: parse("info_bg", &cfg.colors.info_bg, defaults.info_bg),
+            info_fg: parse("info_fg", &cfg.colors.info_fg, defaults.info_fg),
+            warn_bg: parse("warn_bg", &cfg.colors.warn_bg, defaults.warn_bg),
+            warn_fg: parse("warn_fg", &cfg.colors.warn_fg, defaults.warn_fg),
+            error_bg: parse("error_bg", &cfg.colors.error_bg, defaults.error_bg),
+            error_fg: parse("error_fg", &cfg.colors.error_fg, defaults.error_fg),
+        },
+    }
+}
+
+/// Build per-monitor `ToastSpec`s from a fresh `MonitorInfo` list and
+/// the current bar height. Toast `work_area` starts BELOW the bar
+/// reservation so toasts and the clock zone never overlap.
+fn build_toast_specs(
+    infos: &[dwmend_platform::monitor::MonitorInfo],
+    bar_height: i32,
+) -> Vec<ui::toast::ToastSpec> {
+    infos
+        .iter()
+        .map(|m| {
+            let mut wa = m.work_area;
+            // Subtract the bar reservation from the top of the work
+            // area. `work_area` already excludes the OS taskbar; we
+            // additionally exclude DWMend's bar so the toast never
+            // covers the focused-title or clock zones.
+            if bar_height > 0 && wa.h > bar_height {
+                wa.y += bar_height;
+                wa.h -= bar_height;
+            }
+            ui::toast::ToastSpec {
+                monitor_id: m.stable_id.clone(),
+                work_area: wa,
+            }
+        })
+        .collect()
 }

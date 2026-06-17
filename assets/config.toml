@@ -62,6 +62,29 @@ active_fg       = "#101018"
 visible_outline = "#808080"
 dim_fg          = "#606060"
 
+[notifications]
+# Transient on-screen pop-ups (config reloaded, keybinding failures,
+# pause toggles, layout mode flips). Pure read-only feedback; toasts
+# never steal focus and never wait for input.
+enabled        = true
+# Hold-phase duration in milliseconds. Fade-in (~150 ms) and fade-out
+# (~200 ms) are added on top, so 2200 here means ~2.5 s on screen.
+ttl_ms         = 2200
+# Maximum concurrent toasts on a single monitor. Older toasts are
+# pushed into early fade-out beyond this cap.
+max_concurrent = 3
+# Stack anchor corner. Currently only "top_right" is implemented.
+anchor         = "top_right"
+
+[notifications.colors]
+# Severity palette. Bad strings fall back to the built-in defaults.
+info_bg  = "#4FC3F7"
+info_fg  = "#101018"
+warn_bg  = "#F9A825"
+warn_fg  = "#101018"
+error_bg = "#E53935"
+error_fg = "#FFFFFF"
+
 [keybindings]
 # Modifier names accepted: "SUPER" (Win), "ALT", "CTRL", "SHIFT".
 #
@@ -107,6 +130,10 @@ dim_fg          = "#606060"
 #   close
 #   toggle_pause
 #   reload_config
+#   notify <info|warn|error> <text...>
+#                            (show a transient toast on the focused
+#                              monitor; mostly useful from `dwmend cmd`
+#                              for scripting, but can be bound too)
 #   quit
 
 # Focus the next tile (vim key default).

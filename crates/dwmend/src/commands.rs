@@ -47,6 +47,12 @@ pub enum Command {
     // ---- daemon control --------
     TogglePause,
     ReloadConfig,
+    /// Show a transient on-screen notification. Used by the IPC
+    /// `notify <level> <text>` action. Levels: `info` / `warn` /
+    /// `error`. The toast surfaces on the focused monitor; ignored
+    /// silently when the toast subsystem is disabled or hasn't
+    /// started.
+    Notify(crate::ui::toast::ToastLevel, String),
     Reap,
     Quit,
 
@@ -86,6 +92,22 @@ pub fn dispatch(wm: &mut WindowManager, cmd: Command) -> Result<()> {
             // "Resume" instead of "Pause" (and vice versa).
             crate::ui::tray::set_paused(wm.paused);
             tracing::info!(paused = wm.paused, "DWMend pause state changed");
+            crate::ui::toast::show(
+                crate::ui::toast::ToastLevel::Info,
+                if wm.paused {
+                    "Paused".to_string()
+                } else {
+                    "Resumed".to_string()
+                },
+            );
+            Ok(())
+        }
+        Notify(level, text) => {
+            // Routed via the command channel so external IPC clients
+            // and bar-pill clicks share one entry point. The toast
+            // subsystem itself decides the target monitor (the most
+            // recently focused one published via `set_default_monitor`).
+            crate::ui::toast::show(level, text);
             Ok(())
         }
         // ReloadConfig / Quit / Reap / ConfigChanged are handled in main.rs

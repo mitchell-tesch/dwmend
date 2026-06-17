@@ -8,4 +8,5 @@
 //! pollute platform's "thin Win32 wrappers" mandate.
 
 pub mod bar;
+pub mod toast;
 pub mod tray;
