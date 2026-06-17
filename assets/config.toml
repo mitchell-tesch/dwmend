@@ -85,6 +85,29 @@ warn_fg  = "#101018"
 error_bg = "#E53935"
 error_fg = "#FFFFFF"
 
+[peek]
+# Window-peek picker overlay (sticky mode). Opens with the
+# `peek_toggle` action below; while open, your existing
+# `focus left/right/up/down` bindings cycle the highlight
+# instead of moving WM focus. `peek_confirm` commits the
+# selection; pressing `peek_toggle` again or any other action
+# dismisses the picker.
+enabled       = true
+# Overlay width as a fraction of the focused monitor's width.
+# Clamped to 0.3..=1.0 at apply time.
+width_ratio   = 0.8
+# Cell aspect ratio (width / height). 1.6 ≈ 16:10; 1.78 = 16:9.
+cell_aspect   = 1.6
+# Min / max cell dimensions in pixels.
+cell_min_w    = 140
+cell_max_w    = 280
+# Show window titles below each thumbnail.
+show_titles   = true
+# Overlay theme. Empty `highlight` = follow `general.focused_border_color`.
+background    = "#1E1E2E"
+foreground    = "#C0C0C0"
+highlight     = ""
+
 [keybindings]
 # Modifier names accepted: "SUPER" (Win), "ALT", "CTRL", "SHIFT".
 #
@@ -130,6 +153,11 @@ error_fg = "#FFFFFF"
 #   close
 #   toggle_pause
 #   reload_config
+#   peek_toggle              (open or close the workspace picker overlay;
+#                              while open, focus actions cycle the
+#                              highlight instead of moving WM focus)
+#   peek_confirm             (commit the picker selection: focus the
+#                              highlighted window and dismiss)
 #   notify <info|warn|error> <text...>
 #                            (show a transient toast on the focused
 #                              monitor; mostly useful from `dwmend cmd`
@@ -196,6 +224,13 @@ error_fg = "#FFFFFF"
 "ALT+P"       = "toggle_pause"
 "ALT+SHIFT+R" = "reload_config"
 "ALT+SHIFT+Q" = "quit"
+
+# Window peek (sticky-mode picker). `ALT+E` opens the overlay; once
+# open, `ALT+H/L` cycles the highlight (your normal focus binds, the
+# daemon intercepts them while peek is up). `ALT+RETURN` confirms;
+# `ALT+E` again dismisses without selecting.
+"ALT+E"       = "peek_toggle"
+"ALT+RETURN"  = "peek_confirm"
 
 # Rules are matched in order; first match wins.
 # Match keys: exe (basename, equals), class (regex), title (regex).

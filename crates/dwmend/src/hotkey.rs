@@ -236,6 +236,8 @@ pub fn parse_action(s: &str) -> Result<Command> {
         "toggle_pause" => Ok(Command::TogglePause),
         "reload_config" => Ok(Command::ReloadConfig),
         "quit" => Ok(Command::Quit),
+        "peek_toggle" => Ok(Command::PeekToggle),
+        "peek_confirm" => Ok(Command::PeekConfirm),
         "notify" => {
             // Grammar: `notify <level> <text...>`. The level is one
             // word; the text is everything after \u2014 we can't lean on
@@ -482,5 +484,17 @@ mod tests {
     #[test]
     fn parse_notify_rejects_missing_text() {
         assert!(parse_action("notify info").is_err());
+    }
+
+    #[test]
+    fn parse_peek_actions() {
+        assert!(matches!(
+            parse_action("peek_toggle").unwrap(),
+            Command::PeekToggle
+        ));
+        assert!(matches!(
+            parse_action("peek_confirm").unwrap(),
+            Command::PeekConfirm
+        ));
     }
 }

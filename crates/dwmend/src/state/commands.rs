@@ -10,6 +10,19 @@ use dwmend_platform::{Direction, Rect};
 
 impl WindowManager {
     pub fn focus_direction(&mut self, dir: Direction) -> Result<()> {
+        // Peek interception: while the picker is open, directional
+        // focus keys cycle the highlight instead of moving WM focus.
+        // Left/Up step backward; Right/Down step forward — matches
+        // the single-row layout of the picker (and the natural
+        // semantics of "previous"/"next" in a horizontal list).
+        if crate::ui::peek::is_open() {
+            let delta = match dir {
+                Direction::Left | Direction::Up => -1,
+                Direction::Right | Direction::Down => 1,
+            };
+            crate::ui::peek::cycle(delta);
+            return Ok(());
+        }
         let ws_id = self
             .focused_workspace_id()
             .ok_or_else(|| eyre!("no focused workspace"))?;
@@ -382,5 +395,92 @@ impl WindowManager {
             return Ok(());
         };
         dwmend_platform::window::Window(id.0).close()
+    }
+
+    /// Open the peek picker if closed; dismiss it if open. The
+    /// picker shows every managed window on the focused workspace
+    /// (tiled + floating, including stack members other than the
+    /// active one). The currently-focused window starts highlighted
+    /// so a quick toggle-then-confirm is a no-op.
+    ///
+    /// No-op when there is no focused workspace, or when the
+    /// workspace is empty.
+    pub fn peek_toggle(&mut self) -> Result<()> {
+        if crate::ui::peek::is_open() {
+            crate::ui::peek::dismiss();
+            return Ok(());
+        }
+        let Some(ws_id) = self.focused_workspace_id() else {
+            return Ok(());
+        };
+        let Some(focused_mid) = self.focused_monitor.clone() else {
+            return Ok(());
+        };
+        let Some(monitor) = self.monitors.get(&focused_mid) else {
+            return Ok(());
+        };
+        let Some(workspace) = self.workspaces.get(&ws_id) else {
+            return Ok(());
+        };
+
+        // Build the source list. Use `all_windows` so stack members
+        // and floating windows are both pickable — the user can
+        // peek any window they couldn't otherwise reach with
+        // direction keys.
+        let mut sources: Vec<crate::ui::peek::PeekSource> = Vec::new();
+        for wid in workspace.all_windows() {
+            // Resolve title via the cached `ManagedWindow` rather
+            // than going back to Win32, which can fail for windows
+            // that died mid-pick. An empty title still renders
+            // (just shows blank text).
+            let title = self
+                .windows
+                .get(&wid)
+                .map(|mw| mw.title.clone())
+                .unwrap_or_default();
+            sources.push(crate::ui::peek::PeekSource {
+                window_id: wid,
+                source_hwnd: wid.0,
+                title,
+            });
+        }
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        crate::ui::peek::open(
+            crate::ui::peek::PeekMonitor {
+                bounds: monitor.info.bounds,
+            },
+            sources,
+            self.focused_window,
+        );
+        Ok(())
+    }
+
+    /// Commit the current peek selection: focus the highlighted
+    /// window and close the picker. No-op when peek isn't open.
+    pub fn peek_confirm(&mut self) -> Result<()> {
+        let Some(target) = crate::ui::peek::confirm() else {
+            return Ok(());
+        };
+        // The window may have died between the picker opening and
+        // the user confirming (rare but possible). `windows.get`
+        // returning None means we silently skip the focus call.
+        if !self.windows.contains_key(&target) {
+            return Ok(());
+        }
+        // Set WM focus pointers, then SetForegroundWindow so the
+        // user's keystrokes route to the picked window.
+        self.apply_focus_borders(Some(target));
+        self.focused_window = Some(target);
+        if let Err(e) = dwmend_platform::window::Window(target.0).focus() {
+            tracing::warn!(
+                error = %e,
+                hwnd = format!("{:#x}", target.0),
+                "peek_confirm: SetForegroundWindow failed"
+            );
+        }
+        Ok(())
     }
 }

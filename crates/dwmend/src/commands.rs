@@ -53,6 +53,17 @@ pub enum Command {
     /// silently when the toast subsystem is disabled or hasn't
     /// started.
     Notify(crate::ui::toast::ToastLevel, String),
+
+    // ---- window peek -----------
+    /// Open the workspace picker overlay (sticky mode), or close
+    /// it if it's already open. While the overlay is up, the
+    /// existing `focus left/right/up/down` bindings cycle the
+    /// highlight instead of moving WM focus.
+    PeekToggle,
+    /// Commit the current peek selection: focus the highlighted
+    /// window and dismiss. No-op when peek isn't open.
+    PeekConfirm,
+
     Reap,
     Quit,
 
@@ -64,6 +75,20 @@ pub enum Command {
 /// Dispatch a command. The caller must hold the WM mutex.
 pub fn dispatch(wm: &mut WindowManager, cmd: Command) -> Result<()> {
     use Command::*;
+
+    // Auto-dismiss peek for any non-peek, non-focus-direction command
+    // that arrives while the picker is open. Peek is a momentary
+    // modal — pressing any other action implicitly closes it before
+    // the action runs (so `Alt+1` while peeking still switches
+    // workspace, the picker just gets out of the way first).
+    //
+    // FocusDirection is intercepted INSIDE `wm.focus_direction` to
+    // cycle the highlight, so we don't dismiss for it here.
+    let preserves_peek = matches!(cmd, FocusDirection(_) | PeekToggle | PeekConfirm);
+    if !preserves_peek && crate::ui::peek::is_open() {
+        crate::ui::peek::dismiss();
+    }
+
     match cmd {
         FocusDirection(d) => wm.focus_direction(d),
         MoveDirection(d) => wm.move_focused_direction(d),
@@ -83,6 +108,9 @@ pub fn dispatch(wm: &mut WindowManager, cmd: Command) -> Result<()> {
         MoveFocusedToWorkspace(ws) => wm.move_focused_to_workspace(ws),
 
         FocusMonitor(d) => wm.focus_monitor_direction(d),
+
+        PeekToggle => wm.peek_toggle(),
+        PeekConfirm => wm.peek_confirm(),
 
         TogglePause => {
             wm.paused = !wm.paused;

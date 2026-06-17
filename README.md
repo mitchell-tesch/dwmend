@@ -18,8 +18,9 @@ A lightweight (and opinionated) tiling window manager for Windows 11, inspired b
 - **Stack containers** — group multiple windows into one tile. `Alt+G` is smart: with two tiles side-by-side it merges them into a stack on the first press; with a single tile it converts it to a 1-member stack so subsequent windows pile in. `Alt+[` / `Alt+]` cycle through. `Alt+Shift+G` pops the focused member back out into its own tile. The bar shows a `[2/3]` indicator next to the focused title when applicable.
 - **Floating window keyboard control** — `Alt+Shift+H/J/K/L` translates the focused float by 32 px; `Alt+Ctrl+H/J/K/L` resizes the matching edge by 32 px.
 - **Window rules** — match by `exe` / `class` / `title` regex; actions are `ignore`, `float`, `tile`, or `workspace = N` to pin matching apps to a specific workspace at launch (without stealing the user's focus).
+- **Window peek** — `Alt+E` opens a sticky-mode picker overlaying live DWM thumbnails of every window on the focused workspace. Cycle with your normal `Alt+H/L` focus keys (the daemon intercepts them while peek is up); `Alt+Enter` commits, `Alt+E` again dismisses. Configurable under `[peek]`.
 - **Notification toasts** — transient pop-ups for config reloads, keybinding failures, pause toggles, and layout mode flips. Click-through, never steal focus. Configurable under `[notifications]`. Scripts can fire their own via `dwmend cmd "notify info 'Build complete'"`.
-- **TOML config + hot reload** — gaps, colours, rules, **keybindings**, bar theme/segments, **notification colours/TTL** all update on save. Bar height changes still need a daemon restart.
+- **TOML config + hot reload** — gaps, colours, rules, **keybindings**, bar theme/segments, **notification colours/TTL**, **peek theme** all update on save. Bar height changes still need a daemon restart.
 - **IPC** — named-pipe server at `\\.\pipe\DwmendDaemon-v1`. Use `dwmend cmd "focus left"` from PowerShell / AutoHotKey / StreamDeck to drive the daemon, or `dwmend query state` to introspect.
 - **Crash recovery** — `dwmend.exe restore` makes any windows **DWMend** hid visible again if the daemon crashes or is force-killed.
 
@@ -34,7 +35,7 @@ Requires:
 cargo build --release
 ```
 
-The release binary at `target\release\dwmend.exe` (~2.7 MB).
+The release binary at `target\release\dwmend.exe` (~3 MB).
 
 ## Run
 
@@ -83,6 +84,8 @@ On first launch a default config is emitted to
 | `Alt+]` / `Alt+[` | cycle to next / previous stack member |
 | `Alt+P` | pause/resume **DWMend** |
 | `Alt+Shift+R` / `Alt+Shift+Q` | reload config / quit |
+| `Alt+E` | open / dismiss the window-peek picker |
+| `Alt+Enter` | confirm the peek selection (focus highlighted window) |
 | Bar pill click | switch the clicked bar's monitor to that workspace |
 
 The `toggle_layout` action (Dwindle ↔ Spiral on the focused workspace) ships unbound; add `"ALT+SHIFT+L" = "toggle_layout"` (or any other combo) to your `[keybindings]` to wire it up.
@@ -90,7 +93,7 @@ The `toggle_layout` action (Dwindle ↔ Spiral on the focused workspace) ships u
 If any binding fails to register (because another app already claimed it),
 **DWMend** logs a warning at startup and that binding is silently no-op.
 
-> **Existing configs**: DWMend only writes the default config on first run. New options (the `[bar]` section, `[notifications]`, `general.layout`, the stack / `toggle_layout` actions, the `workspace = N` rule action, the `notify` IPC action) won't be present in your existing `%APPDATA%\dwmend\config.toml` — add them manually. The defaults match the previous hard-coded values, so omitting them keeps the old behaviour. Keybinding edits ARE picked up by `Alt+Shift+R` (the listener thread is torn down and respawned with the new table).
+> **Existing configs**: DWMend only writes the default config on first run. New options (the `[bar]` section, `[notifications]`, `[peek]`, `general.layout`, the stack / `toggle_layout` actions, the `workspace = N` rule action, the `notify` / `peek_toggle` / `peek_confirm` actions) won't be present in your existing `%APPDATA%\dwmend\config.toml` — add them manually. The defaults match the previous hard-coded values, so omitting them keeps the old behaviour. Keybinding edits ARE picked up by `Alt+Shift+R` (the listener thread is torn down and respawned with the new table).
 
 ## Privacy
 

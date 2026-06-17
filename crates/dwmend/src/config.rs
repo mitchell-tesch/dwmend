@@ -28,6 +28,9 @@ pub struct Config {
     /// [`dwmend::ui::toast::ToastConfig::default`] so omitting this
     /// section keeps the previously hard-coded behaviour.
     pub notifications: Notifications,
+    /// Window peek (sticky-mode picker overlay). Defaults match
+    /// [`dwmend::ui::peek::PeekConfig::default`].
+    pub peek: Peek,
     /// Raw "key combo string" → "action string" map.
     /// Parsed into hotkey table in `hotkey.rs`.
     pub keybindings: HashMap<String, String>,
@@ -254,6 +257,49 @@ impl Default for NotificationColors {
             warn_fg: "#101018".to_string(),
             error_bg: "#E53935".to_string(),
             error_fg: "#FFFFFF".to_string(),
+        }
+    }
+}
+
+/// Window-peek overlay settings. Mirrors the runtime
+/// [`dwmend::ui::peek::PeekConfig`].
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct Peek {
+    /// Master switch. False makes peek_* actions silent no-ops.
+    pub enabled: bool,
+    /// Overlay width as a fraction of the focused monitor's width.
+    /// Clamped to 0.3..=1.0 at apply time.
+    pub width_ratio: f32,
+    /// Cell aspect ratio (width / height).
+    pub cell_aspect: f32,
+    /// Min cell width in pixels. Cells never shrink below this.
+    pub cell_min_w: i32,
+    /// Max cell width in pixels.
+    pub cell_max_w: i32,
+    /// Show window titles below each thumbnail.
+    pub show_titles: bool,
+    /// Background fill of the overlay (`"#RRGGBB"`).
+    pub background: String,
+    /// Default text colour (titles + footer hint).
+    pub foreground: String,
+    /// Highlight ring colour around the selected cell. Empty
+    /// string means "use general.focused_border_color".
+    pub highlight: String,
+}
+
+impl Default for Peek {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            width_ratio: 0.8,
+            cell_aspect: 1.6,
+            cell_min_w: 140,
+            cell_max_w: 280,
+            show_titles: true,
+            background: "#1E1E2E".to_string(),
+            foreground: "#C0C0C0".to_string(),
+            highlight: String::new(),
         }
     }
 }
