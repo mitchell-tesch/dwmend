@@ -1304,15 +1304,7 @@ unsafe fn draw_bar(hdc: HDC, rc: RECT, snap: &BarSnapshot, colors: &BarColors) -
             bottom: rc.bottom,
         };
         // SAFETY: hdc valid; font selected for the whole draw_bar call.
-        unsafe {
-            draw_centered_text(
-                hdc,
-                clock_rect,
-                s,
-                colors.foreground,
-                DRAW_TEXT_FORMAT(0),
-            )
-        };
+        unsafe { draw_centered_text(hdc, clock_rect, s, colors.foreground, DRAW_TEXT_FORMAT(0)) };
     }
 
     // ---- battery (left of clock, only when device has a battery) ----

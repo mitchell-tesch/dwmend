@@ -567,6 +567,7 @@ pub fn run_daemon() -> Result<()> {
         wm.restore_all_managed_windows();
     }
     dwmend_platform::focus_border::stop();
+    dwmend_platform::focus_sink::stop();
     ui::bar::stop();
     ui::toast::stop();
     ui::peek::stop();
@@ -669,8 +670,8 @@ fn parse_peek_config(peek: &config::Peek, general: &config::General) -> ui::peek
             fallback
         })
     };
-    let focus_color = config::parse_border_color(&general.focused_border_color)
-        .unwrap_or(defaults.highlight);
+    let focus_color =
+        config::parse_border_color(&general.focused_border_color).unwrap_or(defaults.highlight);
     ui::peek::PeekConfig {
         enabled: peek.enabled,
         width_ratio: peek.width_ratio.clamp(0.3, 1.0),
@@ -688,7 +689,8 @@ fn parse_peek_config(peek: &config::Peek, general: &config::General) -> ui::peek
             parse("highlight", &peek.highlight, focus_color)
         },
     }
-}/// Build a `ToastConfig` from the `[notifications]` config table.
+}
+/// Build a `ToastConfig` from the `[notifications]` config table.
 /// Bad colour strings fall back to the toast subsystem's defaults
 /// with a per-field warning so a typo never blocks startup.
 fn parse_toast_config(cfg: &config::Notifications) -> ui::toast::ToastConfig {

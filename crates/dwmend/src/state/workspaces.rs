@@ -93,7 +93,6 @@ impl WindowManager {
         self.switch_workspace(target)
     }
 
-
     pub(super) fn swap_workspace_onto_monitor(
         &mut self,
         mid: &MonitorId,

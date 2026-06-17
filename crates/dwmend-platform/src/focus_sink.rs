@@ -22,35 +22,161 @@
 //!   shifts the user's notion of "what's active" to Explorer.
 //!
 //! A dedicated invisible window is the cleanest "/dev/null" for focus.
+//!
+//! ## Threading
+//!
+//! The sink is a top-level `WS_POPUP` window, which means the OS will route
+//! synchronous broadcast `SendMessage`s at it (`WM_SETTINGCHANGE`,
+//! `WM_DEVICECHANGE`, `WM_THEMECHANGED`, `WM_DISPLAYCHANGE`,
+//! `WM_POWERBROADCAST`, `WM_TIMECHANGE`, internal "is alive" probes, …).
+//! Each of those calls blocks the sender until our wnd_proc runs — and the
+//! wnd_proc only runs when the **owning thread** pumps messages. So the
+//! sink lives on a dedicated `dwmend-focus-sink` thread that does nothing
+//! but `GetMessage` / `DispatchMessage`. Without this, the daemon's main
+//! thread (which runs `crossbeam_channel::select!` instead of a Win32
+//! pump) would stall those broadcasts and Windows would pop the
+//! "this application is not responding" dialog after ~5 seconds.
+//!
+//! `take_focus()` calls `SetForegroundWindow` on the cached HWND from any
+//! thread; that's documented to be process-scoped, not thread-scoped, so
+//! cross-thread invocation is safe.
 
 use crate::Result;
 use color_eyre::eyre::eyre;
+use crossbeam_channel::{Sender, bounded};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, RegisterClassExW, SW_SHOWNOACTIVATE, SetForegroundWindow,
-    ShowWindow, WINDOW_EX_STYLE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
+    PostThreadMessageW, RegisterClassExW, SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WM_QUIT, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
 static SINK: OnceLock<isize> = OnceLock::new();
+static LISTENER_TID: AtomicIsize = AtomicIsize::new(0);
 
-/// Create the sink window on the calling thread. Idempotent (subsequent
-/// calls are no-ops). The sink has no message pump of its own — input
-/// directed at it queues up and is silently dropped, which is precisely
-/// what we want.
+/// Spawn the focus-sink thread. Safe to call once per process — subsequent
+/// calls are no-ops. The thread creates a 1×1 off-screen `WS_POPUP` window,
+/// shows it (so `SetForegroundWindow` accepts it as a target), and then
+/// pumps messages for its entire lifetime.
 pub fn start() -> Result<()> {
     if SINK.get().is_some() {
         return Ok(());
     }
 
+    let (init_tx, init_rx) = bounded::<std::result::Result<isize, String>>(1);
+
+    std::thread::Builder::new()
+        .name("dwmend-focus-sink".into())
+        .spawn(move || run_sink_thread(init_tx))
+        .map_err(|e| eyre!("spawn dwmend-focus-sink thread: {e}"))?;
+
+    // Block until the thread reports the HWND (or fails). Without the
+    // handshake, `take_focus()` could fire before the HWND was ready and
+    // silently no-op on the very first workspace switch.
+    match init_rx
+        .recv()
+        .map_err(|_| eyre!("focus sink thread died during init"))?
+    {
+        Ok(hwnd_isize) => {
+            let _ = SINK.set(hwnd_isize);
+            tracing::info!(hwnd = format!("{hwnd_isize:#x}"), "focus sink ready");
+            Ok(())
+        }
+        Err(e) => Err(eyre!("focus sink init failed: {e}")),
+    }
+}
+
+/// Cooperative shutdown — post `WM_QUIT` to the sink thread so it can
+/// destroy the window and exit cleanly. Idempotent.
+pub fn stop() {
+    let tid = LISTENER_TID.load(Ordering::SeqCst) as u32;
+    if tid == 0 {
+        return;
+    }
+    // SAFETY: posting to a thread ID is always safe; if the thread already
+    // exited the post fails silently which is fine.
+    unsafe {
+        let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Push OS foreground to the sink so the previously-focused (now cloaked
+/// or hidden) window stops receiving keystrokes. Best-effort: if the
+/// foreground-stealing rules deny us, the cloaked window keeps focus — a
+/// log line records it.
+pub fn take_focus() {
+    let Some(&h) = SINK.get() else { return };
+    // SAFETY: HWND from our own CreateWindow. SetForegroundWindow is
+    // documented as cross-thread safe (it only enforces *process* lock).
+    let ok = unsafe { SetForegroundWindow(HWND(h as *mut _)) };
+    if ok.as_bool() {
+        tracing::debug!(hwnd = format!("{:#x}", h), "focus sink: took foreground");
+    } else {
+        tracing::warn!(
+            hwnd = format!("{:#x}", h),
+            "focus sink: SetForegroundWindow denied (foreground-lock); cloaked window may keep keystrokes"
+        );
+    }
+}
+
+// ---- listener thread --------------------------------------------------------
+
+fn run_sink_thread(init_tx: Sender<std::result::Result<isize, String>>) {
+    // SAFETY: GetCurrentThreadId is always safe.
+    let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } as isize;
+    LISTENER_TID.store(tid, Ordering::SeqCst);
+
+    let hwnd = match create_sink_window() {
+        Ok(h) => h,
+        Err(msg) => {
+            let _ = init_tx.send(Err(msg));
+            LISTENER_TID.store(0, Ordering::SeqCst);
+            return;
+        }
+    };
+
+    // Publish the HWND BEFORE entering the pump so `start()` can return and
+    // callers can immediately call `take_focus()`.
+    let _ = init_tx.send(Ok(hwnd.0 as isize));
+
+    // Standard message pump. Every broadcast `SendMessage` aimed at top-
+    // level windows lands here and is dispatched to `wnd_proc` (which just
+    // forwards to `DefWindowProcW`). The OS sees a responsive window and
+    // never raises the "not responding" prompt.
+    let mut msg = MSG::default();
+    loop {
+        // SAFETY: msg is a valid out-param; hwnd=None means all messages
+        // delivered to this thread (including thread-targeted WM_QUIT).
+        let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        // BOOL: 0 = WM_QUIT, -1 = error, else continue.
+        if r.0 <= 0 {
+            break;
+        }
+        // SAFETY: msg is populated.
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    // SAFETY: hwnd was returned by CreateWindowExW and has not been destroyed
+    // elsewhere — the sink thread is the only owner.
+    let _ = unsafe { DestroyWindow(hwnd) };
+    LISTENER_TID.store(0, Ordering::SeqCst);
+    tracing::info!("focus sink thread exited");
+}
+
+fn create_sink_window() -> std::result::Result<HWND, String> {
     let class_name = utf16(b"DwmendFocusSink\0");
 
     // SAFETY: GetModuleHandleW(None) returns the current EXE.
     let hinst = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => HINSTANCE(h.0),
-        Err(e) => return Err(eyre!("GetModuleHandleW: {e}")),
+        Err(e) => return Err(format!("GetModuleHandleW: {e}")),
     };
 
     let class = WNDCLASSEXW {
@@ -88,7 +214,7 @@ pub fn start() -> Result<()> {
             None,
         )
     }
-    .map_err(|e| eyre!("CreateWindowExW (focus sink): {e}"))?;
+    .map_err(|e| format!("CreateWindowExW (focus sink): {e}"))?;
 
     // CRITICAL: SetForegroundWindow refuses HIDDEN windows. Show the sink
     // without activating it so it's eligible as a foreground target while
@@ -98,27 +224,7 @@ pub fn start() -> Result<()> {
     // SAFETY: HWND from CreateWindowExW above.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 
-    let _ = SINK.set(hwnd.0 as isize);
-    tracing::info!(hwnd = format!("{:#x}", hwnd.0 as isize), "focus sink ready");
-    Ok(())
-}
-
-/// Push OS foreground to the sink so the previously-focused (now cloaked
-/// or hidden) window stops receiving keystrokes. Best-effort: if the
-/// foreground-stealing rules deny us, the cloaked window keeps focus — a
-/// log line records it.
-pub fn take_focus() {
-    let Some(&h) = SINK.get() else { return };
-    // SAFETY: HWND from our own CreateWindow.
-    let ok = unsafe { SetForegroundWindow(HWND(h as *mut _)) };
-    if ok.as_bool() {
-        tracing::debug!(hwnd = format!("{:#x}", h), "focus sink: took foreground");
-    } else {
-        tracing::warn!(
-            hwnd = format!("{:#x}", h),
-            "focus sink: SetForegroundWindow denied (foreground-lock); cloaked window may keep keystrokes"
-        );
-    }
+    Ok(hwnd)
 }
 
 unsafe extern "system" fn wnd_proc(

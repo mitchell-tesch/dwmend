@@ -358,19 +358,14 @@ impl WindowManager {
         // Always disable transitions on first encounter — the smoothness lever.
         let _ = win.disable_transitions();
 
-        let target_visible = self
-            .workspaces
-            .get(&ws_id)
-            .is_some_and(|w| w.is_visible());
+        let target_visible = self.workspaces.get(&ws_id).is_some_and(|w| w.is_visible());
 
         // If we're routing to a hidden workspace, hide the HWND so it
         // doesn't keep showing on whatever monitor the OS placed it on.
         // We mark `hidden_by_us` so the WinEvent listener doesn't treat
         // our own hide as a tray-minimise from the app.
         let hidden_by_us = !target_visible;
-        if hidden_by_us
-            && let Err(e) = win.hide()
-        {
+        if hidden_by_us && let Err(e) = win.hide() {
             tracing::warn!(hwnd = %format!("{:#x}", id.0), error = %e,
                 "hide failed during routed admit; window may stay visible");
         }

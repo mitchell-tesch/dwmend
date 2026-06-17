@@ -40,8 +40,8 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, REC
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DT_END_ELLIPSIS, DT_LEFT,
     DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FONT_CLIP_PRECISION,
-    FONT_OUTPUT_PRECISION, FW_NORMAL, FillRect, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT,
-    PROOF_QUALITY, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
+    FONT_OUTPUT_PRECISION, FW_NORMAL, FillRect, HBRUSH, HDC, HGDIOBJ, PAINTSTRUCT, PROOF_QUALITY,
+    SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -282,7 +282,8 @@ pub fn start(specs: Vec<ToastSpec>, cfg: ToastConfig) -> Result<()> {
 pub fn show(level: ToastLevel, text: String) {
     let mid = {
         let g = DEFAULT_MONITOR.lock();
-        g.clone().or_else(|| MONITORS.lock().first().map(|s| s.monitor_id.clone()))
+        g.clone()
+            .or_else(|| MONITORS.lock().first().map(|s| s.monitor_id.clone()))
     };
     let Some(mid) = mid else {
         return;
@@ -584,9 +585,8 @@ fn spawn_toast(hinst: HINSTANCE, class_name_ptr: *const u16, req: ShowRequest) {
     // assumes ownership of the HRGN on success, so we do NOT
     // DeleteObject the handle ourselves. bRedraw=TRUE forces an
     // immediate repaint with the new shape.
-    let rgn = unsafe {
-        CreateRoundRectRgn(0, 0, TOAST_W, TOAST_H, TOAST_RADIUS * 2, TOAST_RADIUS * 2)
-    };
+    let rgn =
+        unsafe { CreateRoundRectRgn(0, 0, TOAST_W, TOAST_H, TOAST_RADIUS * 2, TOAST_RADIUS * 2) };
     if !rgn.is_invalid() {
         // SAFETY: hwnd from our own CreateWindow; rgn just allocated.
         let _ = unsafe { SetWindowRgn(hwnd, Some(rgn), true) };
@@ -594,9 +594,7 @@ fn spawn_toast(hinst: HINSTANCE, class_name_ptr: *const u16, req: ShowRequest) {
 
     // Start fully transparent so the fade-in is clean.
     // SAFETY: hwnd from our own CreateWindow; LWA_ALPHA is documented.
-    let _ = unsafe {
-        SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA)
-    };
+    let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA) };
 
     // Register this toast in the global list.
     {
@@ -629,10 +627,7 @@ fn spawn_toast(hinst: HINSTANCE, class_name_ptr: *const u16, req: ShowRequest) {
 /// host never called `start` (e.g. an in-process test exercising a
 /// different code path that imports `toast`).
 fn config_snapshot() -> ToastConfig {
-    CONFIG
-        .get()
-        .map(|m| *m.lock())
-        .unwrap_or_default()
+    CONFIG.get().map(|m| *m.lock()).unwrap_or_default()
 }
 
 /// Reposition the stack on a single monitor. Toasts are sorted by
@@ -696,7 +691,11 @@ fn reflow_stack(monitor_id: &str) {
 
 /// Reflow every monitor's stack. Used after a topology change.
 fn reflow_all_stacks() {
-    let monitor_ids: Vec<String> = MONITORS.lock().iter().map(|s| s.monitor_id.clone()).collect();
+    let monitor_ids: Vec<String> = MONITORS
+        .lock()
+        .iter()
+        .map(|s| s.monitor_id.clone())
+        .collect();
     for mid in monitor_ids {
         reflow_stack(&mid);
     }
@@ -746,17 +745,12 @@ fn handle_timer(hwnd: HWND) {
     let key = hwnd.0 as isize;
     let state = {
         let toasts = TOASTS.lock();
-        toasts
-            .iter()
-            .find(|t| t.hwnd == key)
-            .map(compute_alpha)
+        toasts.iter().find(|t| t.hwnd == key).map(compute_alpha)
     };
     match state {
         Some(AlphaState::Alpha(a)) => {
             // SAFETY: hwnd is one of our own HWNDs; LWA_ALPHA is documented.
-            let _ = unsafe {
-                SetLayeredWindowAttributes(hwnd, COLORREF(0), a, LWA_ALPHA)
-            };
+            let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), a, LWA_ALPHA) };
         }
         Some(AlphaState::Done) => {
             // Remove from the global list FIRST so the WM_DESTROY
@@ -859,7 +853,9 @@ unsafe fn handle_paint(hwnd: HWND) {
     };
     let Some((level, text, colors)) = snap else {
         // SAFETY: hwnd valid; ps from BeginPaint.
-        unsafe { let _ = EndPaint(hwnd, &ps); };
+        unsafe {
+            let _ = EndPaint(hwnd, &ps);
+        };
         return;
     };
 
@@ -890,7 +886,9 @@ unsafe fn handle_paint(hwnd: HWND) {
     // Select the cached font.
     let font = ensure_font();
     let old_font = unsafe { SelectObject(hdc, HGDIOBJ(font as *mut _)) };
-    unsafe { SetBkMode(hdc, TRANSPARENT); }
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT);
+    }
 
     // Draw the leading severity glyph in a fixed left column.
     let glyph = match level {
@@ -904,7 +902,15 @@ unsafe fn handle_paint(hwnd: HWND) {
         right: 36,
         bottom: TOAST_H,
     };
-    unsafe { draw_text(hdc, glyph_rect, glyph, fg, DT_SINGLELINE | DT_VCENTER | DT_LEFT) };
+    unsafe {
+        draw_text(
+            hdc,
+            glyph_rect,
+            glyph,
+            fg,
+            DT_SINGLELINE | DT_VCENTER | DT_LEFT,
+        )
+    };
 
     // Draw the message text in the remainder.
     let text_rect = RECT {
@@ -923,7 +929,9 @@ unsafe fn handle_paint(hwnd: HWND) {
         )
     };
 
-    unsafe { SelectObject(hdc, old_font); }
+    unsafe {
+        SelectObject(hdc, old_font);
+    }
     // SAFETY: hwnd valid; ps from BeginPaint.
     let _ = unsafe { EndPaint(hwnd, &ps) };
 }
@@ -941,8 +949,8 @@ fn ensure_font() -> isize {
     // GUI font when SelectObject(NULL) is a no-op.
     let font = unsafe {
         CreateFontW(
-            16,                 // height
-            0,                  // width (auto)
+            16, // height
+            0,  // width (auto)
             0,
             0,
             FW_NORMAL.0 as i32, // weight

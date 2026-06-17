@@ -336,9 +336,7 @@ impl<T: Copy + Eq + Hash> BspTree<T> {
                     } else {
                         Axis::Horizontal
                     }
-                } else if let NodeKind::Split { axis, .. } =
-                    self.nodes[parent_idx as usize].kind
-                {
+                } else if let NodeKind::Split { axis, .. } = self.nodes[parent_idx as usize].kind {
                     axis.flip()
                 } else {
                     // Parent is a Stack \u2014 we already early-returned for

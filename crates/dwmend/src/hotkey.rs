@@ -247,7 +247,11 @@ pub fn parse_action(s: &str) -> Result<Command> {
             // Re-find the level + text by peeling the first two tokens
             // off `s` directly. The first token is `notify` itself,
             // already consumed via `verb`.
-            let after_verb = s.trim_start().strip_prefix("notify").unwrap_or("").trim_start();
+            let after_verb = s
+                .trim_start()
+                .strip_prefix("notify")
+                .unwrap_or("")
+                .trim_start();
             let (level_tok, text) = match after_verb.find(char::is_whitespace) {
                 Some(i) => (&after_verb[..i], after_verb[i..].trim()),
                 None => (after_verb, ""),

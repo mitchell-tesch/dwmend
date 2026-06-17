@@ -503,8 +503,7 @@ fn handle_open(hwnd: HWND) {
 
     // Compute overlay geometry: width_ratio of monitor width,
     // height that fits one row of cells + title band + footer + pad.
-    let overlay_w =
-        ((bounds.w as f32) * cfg.width_ratio.clamp(0.3, 1.0)).round() as i32;
+    let overlay_w = ((bounds.w as f32) * cfg.width_ratio.clamp(0.3, 1.0)).round() as i32;
     let n = pending.sources.len() as i32;
     let usable_w = overlay_w - 2 * OUTER_PAD;
     // Ideal cell width: usable_w spread across N cells with gaps.
