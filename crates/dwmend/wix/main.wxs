@@ -2,7 +2,7 @@
 <!--
   WiX Toolset v3 source for the per-user DWMend MSI.
 
-  Build via:  cargo wix -p dwmend --no-build
+  Build via:  cargo wix -p dwmend
 
   Notes for future-me
   ===================
