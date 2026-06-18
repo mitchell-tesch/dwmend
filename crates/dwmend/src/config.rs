@@ -553,4 +553,86 @@ mod tests {
         assert!(parse_border_color("#GGGGGG").is_err());
         assert!(parse_border_color("#12345Z").is_err());
     }
+
+    // ---- Rule::matches ---------------------------------------------------
+    //
+    // Rule matching is the heart of the user `[[rules]]` block. The audit
+    // flagged `filter::is_manageable` as the most-dangerous-untested-path
+    // \u2014 the rule layer is the lever that path uses to admit or veto
+    // windows, so the contract here directly drives what gets tiled.
+
+    fn rule(
+        exe: Option<&str>,
+        class: Option<&str>,
+        title: Option<&str>,
+        action: RuleAction,
+    ) -> Rule {
+        Rule {
+            exe: exe.map(str::to_string),
+            class_re: class.map(|s| Regex::new(s).expect("class regex")),
+            title_re: title.map(|s| Regex::new(s).expect("title regex")),
+            action,
+        }
+    }
+
+    #[test]
+    fn rule_with_no_matchers_never_matches() {
+        // Defensive: a `[[rules]]` block with no exe/class/title selectors
+        // is almost certainly a config typo. We treat it as "match nothing"
+        // so it can't accidentally Ignore every window in the system.
+        let r = rule(None, None, None, RuleAction::Ignore);
+        assert!(!r.matches("anything.exe", "AnyClass", "Any Title"));
+    }
+
+    #[test]
+    fn rule_exe_match_is_case_insensitive() {
+        let r = rule(Some("Spotify.exe"), None, None, RuleAction::Ignore);
+        assert!(r.matches("spotify.exe", "Whatever", ""));
+        assert!(r.matches("SPOTIFY.EXE", "Whatever", ""));
+        assert!(!r.matches("firefox.exe", "Whatever", ""));
+    }
+
+    #[test]
+    fn rule_class_regex_anchors_explicitly() {
+        // We do not auto-anchor; an unanchored pattern matches anywhere.
+        // Documents the contract so users authoring rules know whether
+        // `^Foo` or `Foo` is needed.
+        let anchored = rule(None, Some("^Chrome_"), None, RuleAction::Ignore);
+        assert!(anchored.matches("", "Chrome_PiP", ""));
+        assert!(!anchored.matches("", "OtherChrome_", ""));
+
+        let unanchored = rule(None, Some("Chrome"), None, RuleAction::Ignore);
+        assert!(unanchored.matches("", "OtherChromeWindow", ""));
+    }
+
+    #[test]
+    fn rule_title_regex_match() {
+        let r = rule(None, None, Some(r"^Picture in Picture"), RuleAction::Float);
+        assert!(r.matches("", "Chrome_WidgetWin_1", "Picture in Picture"));
+        assert!(!r.matches("", "Chrome_WidgetWin_1", "GitHub - Chrome"));
+    }
+
+    #[test]
+    fn rule_with_multiple_matchers_requires_all_to_pass() {
+        // Both exe AND title must match. A window with the right exe but
+        // wrong title is NOT covered \u2014 keeps `[[rules]]` precise rather
+        // than firing on every window from the same app.
+        let r = rule(
+            Some("chrome.exe"),
+            None,
+            Some(r"^Picture in Picture"),
+            RuleAction::Float,
+        );
+        assert!(r.matches("chrome.exe", "Chrome_WidgetWin_1", "Picture in Picture"));
+        assert!(!r.matches("chrome.exe", "Chrome_WidgetWin_1", "GitHub - Chrome"));
+        assert!(!r.matches("firefox.exe", "Chrome_WidgetWin_1", "Picture in Picture"));
+    }
+
+    #[test]
+    fn rule_action_value_is_preserved() {
+        // A trivial round-trip; guards against accidental "always Ignore"
+        // refactors of `RuleAction` propagation through the matcher.
+        let r = rule(Some("a.exe"), None, None, RuleAction::Workspace(7));
+        assert!(matches!(r.action, RuleAction::Workspace(7)));
+    }
 }

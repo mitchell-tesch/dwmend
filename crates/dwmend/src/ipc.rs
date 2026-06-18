@@ -286,3 +286,93 @@ fn focused_view(g: &WindowManager) -> Option<FocusedView> {
         title,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Request deserialization ----------------------------------------
+    //
+    // Locks down the wire shape for `dwmend cmd` / `dwmend query` so a
+    // serde-attribute change can't silently break every downstream
+    // script. The request side runs against arbitrary user input from
+    // the named pipe, so robust rejection is the contract.
+
+    #[test]
+    fn cmd_request_with_action_string_parses() {
+        let line = r#"{"kind":"cmd","action":"focus left"}"#;
+        match serde_json::from_str::<Request>(line).unwrap() {
+            Request::Cmd { action } => assert_eq!(action, "focus left"),
+            other => panic!("expected Cmd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_request_state_topic_parses() {
+        let line = r#"{"kind":"query","topic":"state"}"#;
+        match serde_json::from_str::<Request>(line).unwrap() {
+            Request::Query { topic } => assert_eq!(topic, "state"),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_kind_rejected() {
+        // Catches a typo'd subcommand at the boundary instead of letting
+        // it through to a downstream `match` that would silently no-op.
+        let line = r#"{"kind":"explode","action":"focus left"}"#;
+        assert!(serde_json::from_str::<Request>(line).is_err());
+    }
+
+    #[test]
+    fn missing_kind_rejected() {
+        // `kind` is the discriminator; without it serde can't pick a
+        // variant. A malformed client should not be able to bypass
+        // dispatch by omitting the tag.
+        let line = r#"{"action":"focus left"}"#;
+        assert!(serde_json::from_str::<Request>(line).is_err());
+    }
+
+    #[test]
+    fn missing_action_in_cmd_rejected() {
+        let line = r#"{"kind":"cmd"}"#;
+        assert!(serde_json::from_str::<Request>(line).is_err());
+    }
+
+    #[test]
+    fn missing_topic_in_query_rejected() {
+        let line = r#"{"kind":"query"}"#;
+        assert!(serde_json::from_str::<Request>(line).is_err());
+    }
+
+    #[test]
+    fn extra_fields_ignored() {
+        // Forwards-compat: a future protocol revision can add fields
+        // and v0 daemons must still parse the request, ignoring extras.
+        let line = r#"{"kind":"cmd","action":"focus left","priority":"high"}"#;
+        assert!(serde_json::from_str::<Request>(line).is_ok());
+    }
+
+    // ---- Response serialization -----------------------------------------
+    //
+    // The `untagged` enum can shadow variants if their key sets overlap.
+    // These tests freeze the wire shapes the CLI consumer sees.
+
+    #[test]
+    fn ok_response_is_just_ok_true() {
+        let s = serde_json::to_string(&Response::ok()).unwrap();
+        assert_eq!(s, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn ok_data_response_contains_data_field() {
+        let s = serde_json::to_string(&Response::ok_data(serde_json::json!("pong"))).unwrap();
+        assert_eq!(s, r#"{"ok":true,"data":"pong"}"#);
+    }
+
+    #[test]
+    fn err_response_carries_error_message() {
+        let s = serde_json::to_string(&Response::err("boom")).unwrap();
+        assert_eq!(s, r#"{"ok":false,"error":"boom"}"#);
+    }
+}

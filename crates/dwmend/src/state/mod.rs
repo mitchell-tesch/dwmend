@@ -519,3 +519,171 @@ impl WindowManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! `WindowManager::new` shape coverage.
+    //!
+    //! Most state-mutating methods (`manage`, `focus_*`, etc.) call into
+    //! `dwmend_platform::window::Window` for Win32 ops on a real `HWND`
+    //! \u2014 they cannot be exercised in a headless unit test without
+    //! refactoring those calls behind a trait. We can, however, freeze
+    //! the constructor's deterministic shape: how many workspaces it
+    //! creates, which monitor gets which workspace, and where focus
+    //! lands. This locks down the most user-visible startup contract.
+
+    use super::*;
+    use dwmend_layout::rect::Rect;
+    use dwmend_platform::monitor::MonitorInfo;
+
+    fn fake_monitor(idx: u32, primary: bool) -> MonitorInfo {
+        MonitorInfo {
+            hmonitor: 1000 + idx as isize,
+            stable_id: format!("\\\\.\\DISPLAY{idx}|fake-pnp-{idx}"),
+            friendly_name: format!("Fake Monitor {idx}"),
+            bounds: Rect {
+                x: (idx as i32) * 1920,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            work_area: Rect {
+                x: (idx as i32) * 1920,
+                y: 0,
+                w: 1920,
+                h: 1040,
+            },
+            dpi: 96,
+            primary,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_monitor_list() {
+        // The daemon refuses to boot without monitors; surface the
+        // failure as Err instead of silently constructing an unusable
+        // WM with no displays.
+        let r = WindowManager::new(
+            Vec::new(),
+            5,
+            Gaps::default(),
+            AlreadyVisibleBehaviour::FocusOtherMonitor,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn single_monitor_gets_workspace_one() {
+        let wm = WindowManager::new(
+            vec![fake_monitor(1, true)],
+            5,
+            Gaps::default(),
+            AlreadyVisibleBehaviour::FocusOtherMonitor,
+        )
+        .unwrap();
+        assert_eq!(wm.monitors.len(), 1);
+        assert_eq!(wm.workspaces.len(), 5);
+        // The single monitor owns workspace 1.
+        let m = wm.monitors.values().next().unwrap();
+        assert_eq!(m.current_workspace, WorkspaceId(1));
+        // Focus defaults to the only monitor.
+        assert_eq!(wm.focused_monitor.as_ref(), Some(&m.id));
+        assert!(wm.focused_window.is_none());
+    }
+
+    #[test]
+    fn focus_lands_on_primary_monitor_not_first() {
+        // Two monitors with the second flagged primary: focus should
+        // follow the OS's "primary" designation, not iteration order.
+        // Documents the behaviour the user actually expects (the WM
+        // boots with the cursor monitor active, not the leftmost one).
+        let wm = WindowManager::new(
+            vec![fake_monitor(1, false), fake_monitor(2, true)],
+            5,
+            Gaps::default(),
+            AlreadyVisibleBehaviour::FocusOtherMonitor,
+        )
+        .unwrap();
+        let primary = wm
+            .monitors
+            .values()
+            .find(|m| m.info.primary)
+            .expect("primary present");
+        assert_eq!(wm.focused_monitor.as_ref(), Some(&primary.id));
+    }
+
+    #[test]
+    fn workspaces_assigned_to_monitors_in_os_order() {
+        // First N monitors get workspaces 1..=N; remaining workspaces
+        // stay in the pool. This is the contract every user-facing
+        // behaviour (workspace switching, IPC `state` snapshots) builds
+        // on, so any reordering would silently break script-driven
+        // workflows.
+        let wm = WindowManager::new(
+            vec![
+                fake_monitor(1, true),
+                fake_monitor(2, false),
+                fake_monitor(3, false),
+            ],
+            5,
+            Gaps::default(),
+            AlreadyVisibleBehaviour::FocusOtherMonitor,
+        )
+        .unwrap();
+        // Monitors are stored in BTreeMap by stable_id; verify each
+        // monitor's current_workspace is one of 1..=3 and they are unique.
+        let assigned: std::collections::BTreeSet<WorkspaceId> =
+            wm.monitors.values().map(|m| m.current_workspace).collect();
+        assert_eq!(assigned.len(), 3, "every monitor gets a distinct workspace");
+        for ws in &assigned {
+            assert!((1..=3).contains(&ws.0), "ws {} outside expected range", ws.0);
+        }
+    }
+
+    #[test]
+    fn fewer_workspaces_than_monitors_extras_share_last_workspace() {
+        // Edge case: declared workspace_count is less than monitor count
+        // (rare but possible if a user sets workspace_count=1 and plugs
+        // in a second monitor). Extras should bind to the last available
+        // workspace rather than crashing or skipping the monitor.
+        let wm = WindowManager::new(
+            vec![fake_monitor(1, true), fake_monitor(2, false)],
+            1,
+            Gaps::default(),
+            AlreadyVisibleBehaviour::FocusOtherMonitor,
+        )
+        .unwrap();
+        assert_eq!(wm.workspaces.len(), 1);
+        for m in wm.monitors.values() {
+            assert_eq!(m.current_workspace, WorkspaceId(1));
+        }
+    }
+
+    #[test]
+    fn no_focused_window_initially() {
+        // Nothing managed yet, so no focused window. Defends against
+        // any future "auto-pick first window" change that would steal
+        // focus from whatever the user was using before launching DWMend.
+        let wm = WindowManager::new(
+            vec![fake_monitor(1, true)],
+            3,
+            Gaps::default(),
+            AlreadyVisibleBehaviour::FocusOtherMonitor,
+        )
+        .unwrap();
+        assert!(wm.focused_window.is_none());
+        assert!(wm.windows.is_empty());
+    }
+
+    #[test]
+    fn workspace_of_window_returns_none_for_unmanaged_id() {
+        let wm = WindowManager::new(
+            vec![fake_monitor(1, true)],
+            3,
+            Gaps::default(),
+            AlreadyVisibleBehaviour::FocusOtherMonitor,
+        )
+        .unwrap();
+        assert!(wm.workspace_of_window(WindowId(0xDEAD_BEEF)).is_none());
+    }
+}

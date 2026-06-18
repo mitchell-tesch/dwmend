@@ -34,7 +34,14 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE,
-    GetLastError, HANDLE,
+    GetLastError, HANDLE, HLOCAL, LocalFree,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, FlushFileBuffers, OPEN_EXISTING,
@@ -44,7 +51,8 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_WAIT, WaitNamedPipeW,
 };
-use windows::core::PCWSTR;
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::core::{PCWSTR, PWSTR};
 
 /// The pipe name. The `v1` suffix lets us bump the protocol later without
 /// breaking older CLIs that try to connect to a newer daemon (or vice versa).
@@ -105,10 +113,162 @@ pub fn client_send(request: &str) -> Result<String> {
 
 // ---- server -----------------------------------------------------------------
 
+/// RAII wrapper around a `LocalAlloc`-owned security descriptor so the
+/// memory is freed if the server thread ever unwinds. The descriptor is
+/// referenced by every subsequent `CreateNamedPipeW` call \u2014 the kernel
+/// copies it into each new pipe object, so the lifetime here only needs
+/// to outlive the calls themselves.
+struct SecurityDescriptor {
+    psd: PSECURITY_DESCRIPTOR,
+}
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.psd.0.is_null() {
+            // SAFETY: psd was allocated by
+            // ConvertStringSecurityDescriptorToSecurityDescriptorW, whose
+            // documented buffer-ownership contract is "free with
+            // LocalFree". HLOCAL is a transparent pointer type.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.psd.0)));
+            }
+            self.psd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        }
+    }
+}
+
+/// Build a security descriptor whose DACL grants the current user
+/// (and only the current user) full access to the pipe.
+///
+/// Without this the pipe inherits the token's default DACL, which
+/// allows ANY same-user process to send commands or scrape window
+/// state \u2014 the audit's flagged Tier-2 risk. SDDL form:
+///
+/// ```text
+///   D:P(A;;GA;;;<user-sid>)
+/// ```
+///
+/// `D:P` = DACL, protected from inheritance. `A` = Allow ACE. `GA` =
+/// Generic All. The trailing SID is the current user's, looked up via
+/// the process token. We deliberately do NOT also grant
+/// `BUILTIN\\Administrators` \u2014 a personal WM has no admin-tooling
+/// surface, and admins can elevate into the user session anyway.
+fn owner_only_security_descriptor() -> Result<SecurityDescriptor> {
+    let sid_string = current_user_sid_string()?;
+    let sddl = format!("D:P(A;;GA;;;{sid_string})");
+    let sddl_w = wide(&sddl);
+
+    let mut psd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // SAFETY: sddl_w is a null-terminated UTF-16 string; psd is a valid
+    // out-pointer; the optional size out-param is left None because we
+    // don't need to know the descriptor size \u2014 the kernel does.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_w.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+    }
+    .map_err(|e| eyre!("ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}): {e}"))?;
+
+    if psd.0.is_null() {
+        return Err(eyre!("ConvertStringSecurityDescriptorToSecurityDescriptorW returned NULL"));
+    }
+    Ok(SecurityDescriptor { psd })
+}
+
+/// Look up the current process's user SID and convert it to its SDDL
+/// string form (e.g. `S-1-5-21-...-1001`). Allocates internally; all
+/// allocations are freed before return.
+fn current_user_sid_string() -> Result<String> {
+    // 1) Open the process token.
+    let mut token = HANDLE::default();
+    // SAFETY: GetCurrentProcess is an infallible pseudo-handle; token
+    // is a valid out-param.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|e| eyre!("OpenProcessToken: {e}"))?;
+    // RAII: ensure CloseHandle runs on every exit path including ?.
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            // SAFETY: handle was returned by OpenProcessToken.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+    let _token_guard = TokenGuard(token);
+
+    // 2) Probe the size of the TokenUser info.
+    let mut needed = 0u32;
+    // SAFETY: token is valid; first call deliberately undersized so the
+    // kernel reports the required buffer size in `needed` and returns
+    // ERROR_INSUFFICIENT_BUFFER \u2014 we ignore the Result.
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+    if needed == 0 {
+        return Err(eyre!("GetTokenInformation reported zero size for TokenUser"));
+    }
+    let mut buf = vec![0u8; needed as usize];
+    // SAFETY: buf has `needed` bytes; pointer cast is to a documented
+    // out-buffer for TOKEN_USER.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+    }
+    .map_err(|e| eyre!("GetTokenInformation(TokenUser): {e}"))?;
+
+    // 3) Extract the SID pointer from the returned TOKEN_USER struct.
+    // SAFETY: kernel filled `buf` with a TOKEN_USER followed by the SID
+    // bytes; the cast respects layout.
+    let token_user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+    let sid = token_user.User.Sid;
+    if sid.0.is_null() {
+        return Err(eyre!("TOKEN_USER returned a NULL SID"));
+    }
+
+    // 4) Convert to its SDDL string form. The returned PWSTR is owned
+    // by the caller and must be freed with LocalFree.
+    let mut sid_str = PWSTR::null();
+    // SAFETY: sid is non-null per check above; sid_str is a valid out-pointer.
+    unsafe { ConvertSidToStringSidW(sid, &mut sid_str) }
+        .map_err(|e| eyre!("ConvertSidToStringSidW: {e}"))?;
+    if sid_str.is_null() {
+        return Err(eyre!("ConvertSidToStringSidW returned NULL"));
+    }
+    // SAFETY: sid_str is null-terminated per the API contract.
+    let owned = unsafe { sid_str.to_string() }
+        .map_err(|e| eyre!("PWSTR::to_string: {e}"));
+    // Free regardless of whether to_string succeeded.
+    // SAFETY: pointer was allocated by ConvertSidToStringSidW.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sid_str.0 as *mut _)));
+    }
+    owned
+}
+
 fn run_server_thread() {
     tracing::info!(pipe = PIPE_NAME, "ipc server started");
+
+    // Build the owner-only security descriptor once. If this fails we
+    // fall back to NULL (default DACL: any same-user process can
+    // connect) and log a warning, so a Win32 quirk on some host can
+    // never block the daemon from booting \u2014 it just degrades to
+    // pre-Tier-2 behaviour.
+    let sd = match owner_only_security_descriptor() {
+        Ok(sd) => Some(sd),
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "ipc: failed to build owner-only ACL; pipe will use default DACL");
+            None
+        }
+    };
+
     loop {
-        let pipe = match create_pipe() {
+        let pipe = match create_pipe(sd.as_ref()) {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!(error = %e, "ipc: failed to create pipe; sleeping 1 s");
@@ -124,20 +284,30 @@ fn run_server_thread() {
     }
 }
 
-fn create_pipe() -> std::result::Result<HANDLE, String> {
+fn create_pipe(sd: Option<&SecurityDescriptor>) -> std::result::Result<HANDLE, String> {
     let name = wide(PIPE_NAME);
+    // Build a SECURITY_ATTRIBUTES referencing the descriptor when we
+    // have one. Kept on the stack: CreateNamedPipeW captures the
+    // descriptor into the kernel object, so the SA struct only needs
+    // to live for the duration of the call.
+    let sa = sd.map(|sd| SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.psd.0,
+        bInheritHandle: false.into(),
+    });
     // SAFETY: name is a null-terminated UTF-16 string; other args are
-    // documented integer constants.
+    // documented integer constants. `sa`, when present, points to a
+    // valid descriptor allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
     let h = unsafe {
         CreateNamedPipeW(
             PCWSTR(name.as_ptr()),
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1, // max concurrent instances — we serialise
+            1, // max concurrent instances \u2014 we serialise
             4096,
             4096,
             0,
-            None,
+            sa.as_ref().map(|x| x as *const _),
         )
     };
     if h.is_invalid() {

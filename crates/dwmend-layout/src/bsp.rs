@@ -1363,6 +1363,56 @@ mod tests {
         assert!(w1_after > w1_before);
     }
 
+    #[test]
+    fn resize_clamps_so_no_tile_collapses_to_zero() {
+        // Audit-flagged "surviving mutation" test. The split ratio is
+        // clamped to [0.1, 0.9]; if a regression weakened that lower
+        // bound to 0.0, a single oversized resize call could drive a
+        // tile to width 0 (or even negative when factoring in gaps),
+        // hiding it entirely. Drive the resize past the bound and assert
+        // every tile is left visibly occupiable.
+        let mut t = BspTree::<u32>::new();
+        t.insert(1, fhd());
+        t.insert(2, fhd());
+
+        // Push the split as far left as possible \u2014 enough to overshoot
+        // the 0.1 floor by an order of magnitude.
+        t.resize(1, Direction::Left, 10_000, fhd());
+        let rects = t.compute(fhd(), 0);
+        assert_eq!(rects.len(), 2);
+        for (id, r) in &rects {
+            assert!(
+                r.w > 0,
+                "tile {id} collapsed to width {}; resize clamp regressed",
+                r.w
+            );
+            assert!(
+                r.h > 0,
+                "tile {id} collapsed to height {}; resize clamp regressed",
+                r.h
+            );
+        }
+        // Specifically: the smaller side must still be at least 10% of
+        // the work area's width \u2014 the documented contract of the 0.1
+        // clamp. Pinning the lower edge directly catches any "0.05 is
+        // close enough" softening of the bound.
+        let min_w = rects.iter().map(|(_, r)| r.w).min().unwrap();
+        let total = fhd().w;
+        assert!(
+            min_w >= total / 10,
+            "smaller tile width {min_w} below 10% of total {total}; clamp regressed"
+        );
+
+        // And the symmetric case in the opposite direction.
+        t.resize(1, Direction::Right, 10_000, fhd());
+        let rects = t.compute(fhd(), 0);
+        let min_w = rects.iter().map(|(_, r)| r.w).min().unwrap();
+        assert!(
+            min_w >= total / 10,
+            "smaller tile width {min_w} below 10% of total after right-saturation"
+        );
+    }
+
     // ---- stack containers ------------------------------------------------
 
     #[test]
