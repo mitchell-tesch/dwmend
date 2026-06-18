@@ -51,11 +51,13 @@
         Manufacturer="Mitchell Tesch" />
 
     <!-- Per-user mode: the MSI runs entirely in user context with no
-         elevation prompt. ARPNOMODIFY hides the unused "Modify" button
-         in Add/Remove Programs since we don't ship a feature picker. -->
+         elevation prompt. ARPNOMODIFY is intentionally NOT declared
+         here \u2014 the WixUI_Minimal extension below already sets it
+         (Minimal UI has no feature picker, so the Modify button would
+         do nothing), and a duplicate Property declaration is a hard
+         link error (LGHT0091). -->
     <Property Id="ALLUSERS" Secure="yes" />
     <Property Id="MSIINSTALLPERUSER" Value="1" Secure="yes" />
-    <Property Id="ARPNOMODIFY" Value="1" Secure="yes" />
 
     <!-- Add/Remove Programs metadata. -->
     <Icon Id="DwmendIcon.exe" SourceFile="..\..\assets\icon.ico" />
