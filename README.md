@@ -4,6 +4,11 @@
 
 # DWMend — Tiling Window Manager for Windows 11
 
+[![CI](https://github.com/mitchell-tesch/dwmend/actions/workflows/ci.yml/badge.svg)](https://github.com/mitchell-tesch/dwmend/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform: Windows 11](https://img.shields.io/badge/platform-Windows%2011-0078d6)
+![MSRV](https://img.shields.io/badge/rustc-1.85%2B-orange?logo=rust)
+
 A lightweight (and opinionated) tiling window manager for Windows 11, inspired by
 [Hyprland](https://hyprland.org/) and [komorebi](https://github.com/LGUG2Z/komorebi). A mend for the DWM.
 
