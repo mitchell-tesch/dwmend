@@ -100,16 +100,18 @@ pub fn run_daemon() -> Result<()> {
     }
     let cfg = config::Config::load(&config_path)?;
     let mut rules = cfg.compile_rules()?;
-    // Bar height is captured here and reused for the lifetime of the
-    // daemon. Hot-reloading the height would require resizing every bar
-    // HWND AND recomposing every workspace's gaps reservation, which we
-    // defer to a daemon restart with a warning (see the reload arm).
-    let bar_height = if cfg.general.bar_enabled {
+    // Bar height drives both the bar HWND geometry and the top outer
+    // gap reservation. Made `mut` so the config-reload path can
+    // hot-resize the bar (`ui::bar::set_height`) and recompose the
+    // workspace gaps without a daemon restart \u2014 closes the audit's
+    // Tier-3 \"static bar height\" callout. Persist the live value
+    // across reloads in this single binding so the reconcile arm and
+    // toast-spec rebuild always read the current height.
+    let mut bar_height = if cfg.general.bar_enabled {
         cfg.bar.height.max(16)
     } else {
         0
     };
-    let original_bar_height = bar_height;
     let gaps = compose_gaps(&cfg, bar_height);
     let border_color = parse_focus_color(&cfg);
     let bar_colors = parse_bar_colors(&cfg.bar);
@@ -481,25 +483,49 @@ pub fn run_daemon() -> Result<()> {
                                             }
                                         }
                                     }
-                                    // Bar height is baked into the gap
-                                    // composer at startup; resizing every
-                                    // bar HWND on the fly is a future
-                                    // enhancement. Warn so config edits
-                                    // don't silently no-op.
+                                    // Bar height is hot-reloadable: resize
+                                    // every bar HWND in place, refresh the
+                                    // toast offset, recompose `wm.gaps`.
+                                    // The retile_all at the end of this
+                                    // arm flushes the new gaps into every
+                                    // workspace's tile geometry.
                                     let new_bar_h = if new_cfg.general.bar_enabled {
                                         new_cfg.bar.height.max(16)
                                     } else {
                                         0
                                     };
-                                    if new_bar_h != original_bar_height {
-                                        tracing::warn!(
-                                            old = original_bar_height, new = new_bar_h,
-                                            "bar height change detected; restart dwmend to apply"
+                                    if new_bar_h != bar_height {
+                                        ui::bar::set_height(new_bar_h);
+                                        // Toasts anchor BELOW the bar, so a
+                                        // height change shifts every per-monitor
+                                        // toast work-area. Push a fresh spec
+                                        // list before the new height is folded
+                                        // into `bar_height` so any toast emitted
+                                        // during this reload (including the
+                                        // \"Config reloaded\" success toast
+                                        // below) lands at the correct anchor.
+                                        let infos = match
+                                            dwmend_platform::monitor::enumerate()
+                                        {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                tracing::warn!(error = %e,
+                                                    "monitor enumerate failed during \
+                                                     bar-height reload; toast specs \
+                                                     stay on previous offset");
+                                                Vec::new()
+                                            }
+                                        };
+                                        if !infos.is_empty() {
+                                            ui::toast::sync_monitors(
+                                                build_toast_specs(&infos, new_bar_h),
+                                            );
+                                        }
+                                        tracing::info!(
+                                            old = bar_height, new = new_bar_h,
+                                            "bar height hot-reloaded"
                                         );
-                                        ui::toast::show(
-                                            ui::toast::ToastLevel::Warn,
-                                            "Bar height changed; restart to apply".to_string(),
-                                        );
+                                        bar_height = new_bar_h;
                                     }
                                     rules = new_rules;
                                     let mut wm = wm.lock();

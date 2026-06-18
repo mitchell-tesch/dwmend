@@ -636,7 +636,11 @@ mod tests {
             wm.monitors.values().map(|m| m.current_workspace).collect();
         assert_eq!(assigned.len(), 3, "every monitor gets a distinct workspace");
         for ws in &assigned {
-            assert!((1..=3).contains(&ws.0), "ws {} outside expected range", ws.0);
+            assert!(
+                (1..=3).contains(&ws.0),
+                "ws {} outside expected range",
+                ws.0
+            );
         }
     }
 

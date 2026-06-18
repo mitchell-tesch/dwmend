@@ -102,9 +102,7 @@ pub fn restart() -> Result<()> {
         return Err(eyre!("winevent::restart called before start"));
     }
     if LISTENER_ALIVE.load(Ordering::SeqCst) {
-        return Err(eyre!(
-            "winevent listener still alive; refusing to restart"
-        ));
+        return Err(eyre!("winevent listener still alive; refusing to restart"));
     }
     spawn_thread()
 }

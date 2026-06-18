@@ -60,8 +60,8 @@ use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawIconEx,
-    GetMessageW, HICON, HWND_TOPMOST, IDC_ARROW, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED,
-    LoadCursorW, LoadImageW, MSG, PostMessageW, PostThreadMessageW, RegisterClassExW,
+    GetMessageW, GetWindowRect, HICON, HWND_TOPMOST, IDC_ARROW, IMAGE_ICON, LR_DEFAULTCOLOR,
+    LR_SHARED, LoadCursorW, LoadImageW, MSG, PostMessageW, PostThreadMessageW, RegisterClassExW,
     SET_WINDOW_POS_FLAGS, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetTimer,
     SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_DESTROY, WM_ERASEBKGND,
     WM_LBUTTONUP, WM_PAINT, WM_QUIT, WM_TIMER, WM_USER, WNDCLASSEXW, WS_EX_NOACTIVATE,
@@ -91,6 +91,14 @@ const WM_WTM_BAR_REFRESH: u32 = WM_USER + 1;
 /// listener `GetMessageW` lives, so we have to do this work there — not on
 /// the host thread — to keep WM_PAINT routing intact.
 const WM_WTM_BAR_SYNC: u32 = WM_USER + 2;
+
+/// Thread message posted when the configured bar height changes. The bar
+/// thread reads the new value from `HEIGHT` and `SetWindowPos`es every
+/// live bar HWND to it (preserving x/y/width). Cached GDI resources are
+/// dropped on the host side before the post so the next `WM_PAINT`
+/// rebuilds with the new geometry. Used by the daemon's config-reload
+/// path so a `[bar].height` edit takes effect without a daemon restart.
+const WM_WTM_BAR_HEIGHT: u32 = WM_USER + 3;
 
 /// Timer id used by every bar window to refresh the live clock once per
 /// second. The timer is delivered as a `WM_TIMER` message; we re-format the
@@ -580,6 +588,41 @@ pub fn sync_monitors(specs: Vec<BarSpec>) {
     }
 }
 
+/// Apply a new bar height live, without a daemon restart.
+///
+/// Updates the shared `HEIGHT` slot, drops the cached GDI resources
+/// (whose font/brush dimensions are keyed on the previous height), and
+/// asks the bar listener thread to `SetWindowPos` every existing bar
+/// HWND to the new height. The host crate is responsible for any
+/// downstream consequences \u2014 recomposing `wm.gaps`, retiling, and
+/// re-publishing toast specs that account for the new bar reservation.
+///
+/// No-op if the bar subsystem hasn't been started or the height is
+/// unchanged.
+pub fn set_height(new: i32) {
+    let new = new.max(16) as isize;
+    let prev = HEIGHT.swap(new, Ordering::SeqCst);
+    if prev == new {
+        return;
+    }
+    // GDI resources cache `key_height`; the next WM_PAINT will rebuild
+    // them lazily once we drop the slot. Doing this from the host thread
+    // is fine because `RESOURCES` is a plain `Mutex`.
+    drop_cached_resources();
+
+    let tid = LISTENER_TID.load(Ordering::SeqCst) as u32;
+    if tid == 0 {
+        // Subsystem not running; HEIGHT update is sufficient \u2014 the next
+        // `start()` will pick it up.
+        return;
+    }
+    // SAFETY: posting to a thread ID is always safe.
+    unsafe {
+        let _ = PostThreadMessageW(tid, WM_WTM_BAR_HEIGHT, WPARAM(0), LPARAM(0));
+    }
+    tracing::info!(old = prev, new, "bar height updated");
+}
+
 // ---- bar thread ------------------------------------------------------------
 
 fn run_bar_thread(specs: Vec<BarSpec>, init_tx: Sender<std::result::Result<(), String>>) {
@@ -639,11 +682,25 @@ fn run_bar_thread(specs: Vec<BarSpec>, init_tx: Sender<std::result::Result<(), S
         }
         // Thread messages (msg.hwnd is null) we need to handle inline \u2014
         // DispatchMessageW skips them.
-        if msg.hwnd.0.is_null() && msg.message == WM_WTM_BAR_SYNC {
-            if let Some(specs) = PENDING_SYNC.lock().take() {
-                sync_bars_on_thread(&specs, hinst, class_name_ptr, height);
+        if msg.hwnd.0.is_null() {
+            // Always read the latest configured height for these handlers \u2014
+            // the daemon may have called `set_height` between our startup
+            // snapshot and this message, and using the captured local would
+            // resize new bars to the OLD value.
+            let cur_height = HEIGHT.load(Ordering::SeqCst) as i32;
+            match msg.message {
+                WM_WTM_BAR_SYNC => {
+                    if let Some(specs) = PENDING_SYNC.lock().take() {
+                        sync_bars_on_thread(&specs, hinst, class_name_ptr, cur_height);
+                    }
+                    continue;
+                }
+                WM_WTM_BAR_HEIGHT => {
+                    resize_bars_on_thread(cur_height);
+                    continue;
+                }
+                _ => {}
             }
-            continue;
         }
         // SAFETY: msg is populated.
         unsafe {
@@ -790,6 +847,67 @@ fn sync_bars_on_thread(
         } else {
             create_bar_hwnd(&mut bars, spec, hinst, class_name_ptr, height);
             tracing::info!(monitor = %spec.monitor_id, "bar HWND created (monitor added)");
+        }
+    }
+}
+
+/// Resize every existing bar HWND to `height` while preserving its current
+/// `(x, y, width)`. Called from the bar listener thread in response to a
+/// `WM_WTM_BAR_HEIGHT` posted by [`set_height`].
+///
+/// Reading the current bounds back from each HWND (rather than re-using a
+/// cached `BarSpec`) keeps the operation independent of whether a
+/// [`sync_monitors`] has happened since startup; both code paths converge
+/// on whatever the OS currently reports for the bar's position.
+fn resize_bars_on_thread(height: i32) {
+    let Some(bars) = BARS.get() else { return };
+    let bars = bars.lock();
+    for (mid, handle) in bars.iter() {
+        let hwnd = HWND(handle.hwnd as *mut _);
+
+        // Pull the bar's current rect back from the OS so we can preserve
+        // its x / y / width while substituting the new height. A stored
+        // BarSpec would also work, but reading the live rect avoids a
+        // race with any in-flight `sync_monitors` and keeps `resize` and
+        // `sync` from having to share a cache.
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        // SAFETY: hwnd is from our own CreateWindow; rect is a valid
+        // out-param.
+        let got = unsafe { GetWindowRect(hwnd, &mut rect) };
+        let (x, y, w) = match got {
+            Ok(()) => (rect.left, rect.top, rect.right - rect.left),
+            Err(e) => {
+                tracing::warn!(monitor = %mid, error = %e,
+                    "GetWindowRect failed during bar resize; skipping");
+                continue;
+            }
+        };
+
+        // SAFETY: hwnd is from our own CreateWindow; flag bitset uses
+        // documented constants.
+        let r = unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                w,
+                height,
+                SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0),
+            )
+        };
+        if let Err(e) = r {
+            tracing::warn!(monitor = %mid, error = %e,
+                "SetWindowPos failed during bar resize");
+            continue;
+        }
+
+        // Force a repaint so the new height is filled even if the OS
+        // didn't deliver an automatic WM_PAINT for the resize (it
+        // sometimes elides them when only one dimension changes).
+        // SAFETY: hwnd is from our own CreateWindow.
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
 }

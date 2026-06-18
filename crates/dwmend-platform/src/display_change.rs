@@ -64,9 +64,7 @@ pub fn restart() -> Result<()> {
         return Err(eyre!("display_change::restart called before start"));
     }
     if LISTENER_ALIVE.load(Ordering::SeqCst) {
-        return Err(eyre!(
-            "display listener still alive; refusing to restart"
-        ));
+        return Err(eyre!("display listener still alive; refusing to restart"));
     }
     spawn_thread()
 }

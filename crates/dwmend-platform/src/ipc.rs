@@ -173,7 +173,9 @@ fn owner_only_security_descriptor() -> Result<SecurityDescriptor> {
     .map_err(|e| eyre!("ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}): {e}"))?;
 
     if psd.0.is_null() {
-        return Err(eyre!("ConvertStringSecurityDescriptorToSecurityDescriptorW returned NULL"));
+        return Err(eyre!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW returned NULL"
+        ));
     }
     Ok(SecurityDescriptor { psd })
 }
@@ -205,7 +207,9 @@ fn current_user_sid_string() -> Result<String> {
     // ERROR_INSUFFICIENT_BUFFER \u2014 we ignore the Result.
     let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
     if needed == 0 {
-        return Err(eyre!("GetTokenInformation reported zero size for TokenUser"));
+        return Err(eyre!(
+            "GetTokenInformation reported zero size for TokenUser"
+        ));
     }
     let mut buf = vec![0u8; needed as usize];
     // SAFETY: buf has `needed` bytes; pointer cast is to a documented
@@ -240,8 +244,7 @@ fn current_user_sid_string() -> Result<String> {
         return Err(eyre!("ConvertSidToStringSidW returned NULL"));
     }
     // SAFETY: sid_str is null-terminated per the API contract.
-    let owned = unsafe { sid_str.to_string() }
-        .map_err(|e| eyre!("PWSTR::to_string: {e}"));
+    let owned = unsafe { sid_str.to_string() }.map_err(|e| eyre!("PWSTR::to_string: {e}"));
     // Free regardless of whether to_string succeeded.
     // SAFETY: pointer was allocated by ConvertSidToStringSidW.
     unsafe {
