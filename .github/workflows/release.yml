@@ -89,13 +89,50 @@ jobs:
       # is attached to the GitHub Release alongside the portable .exe so
       # users can pick whichever distribution model fits.
 
-      - name: Install WiX Toolset v3.14
+      - name: Install WiX Toolset v3
         shell: pwsh
+        # `windows-latest` ships with a recent WiX 3.x preinstalled.
+        # `choco install wixtoolset --version=3.14.1` fails when a NEWER
+        # version is already present, which kills the whole job. Probe
+        # PATH and the standard install locations first; only fall back
+        # to choco if WiX is genuinely absent.
         run: |
-          choco install wixtoolset --version=3.14.1 -y --no-progress
-          # Add WiX bin to PATH for the rest of the job. cargo-wix shells
-          # out to `candle.exe` and `light.exe`, so they need to be on PATH.
-          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          $ErrorActionPreference = 'Stop'
+
+          # 1. Already on PATH? Trust it.
+          $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+          if ($candle) {
+            Write-Host "WiX already on PATH: $($candle.Source)"
+            exit 0
+          }
+
+          # 2. Common preinstalled locations on windows-latest. Match any
+          #    3.x version so a runner image bump doesn't break us.
+          $bin = Get-ChildItem `
+              'C:\Program Files (x86)\WiX Toolset v3.*\bin' `
+              -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+
+          if ($bin -and (Test-Path "$($bin.FullName)\candle.exe")) {
+            Write-Host "Found preinstalled WiX at $($bin.FullName)"
+            Add-Content -Path $env:GITHUB_PATH -Value $bin.FullName
+            exit 0
+          }
+
+          # 3. Genuinely missing \u2014 install whatever choco has.
+          Write-Host "WiX not preinstalled; installing via Chocolatey"
+          choco install wixtoolset -y --no-progress
+          $bin = Get-ChildItem `
+              'C:\Program Files (x86)\WiX Toolset v3.*\bin' `
+              -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+          if (-not $bin) {
+            Write-Error "WiX bin directory not found after install"
+            exit 1
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $bin.FullName
 
       - name: Install cargo-wix
         # `--locked` keeps the install reproducible; the rust-cache step
