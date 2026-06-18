@@ -25,7 +25,16 @@ pub fn start(path: &Path, tx: Sender<Command>) -> Result<RecommendedWatcher> {
     let mut last = Instant::now() - Duration::from_secs(60);
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<notify::Event>| {
-            let Ok(ev) = res else { return };
+            // Surface notify errors instead of silently dropping them \u2014 a
+            // persistent failure here means hot-reload is dead and the user
+            // would otherwise have no signal beyond \"my edits don't take.\"
+            let ev = match res {
+                Ok(ev) => ev,
+                Err(e) => {
+                    tracing::warn!(error = %e, "config watcher error");
+                    return;
+                }
+            };
             // Only react to events on our specific file.
             if !ev.paths.iter().any(|p| p == &file) {
                 return;

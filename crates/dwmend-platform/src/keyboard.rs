@@ -100,6 +100,11 @@ pub struct HotkeyMatch {
 static EVENT_TX: OnceLock<Sender<HotkeyMatch>> = OnceLock::new();
 static LISTENER_TID: AtomicIsize = AtomicIsize::new(0);
 
+/// `true` while a listener thread is running. Cleared by an RAII guard in
+/// the thread on any exit path including panic. Polled by the daemon's
+/// supervisor tick to detect silent thread death.
+static LISTENER_ALIVE: AtomicBool = AtomicBool::new(false);
+
 /// When true, the host-side dispatcher should ignore non-toggle commands.
 /// (We don't suppress the WM_HOTKEY itself; the host crate decides what to
 /// act on. This flag exists as a coordination point with the rest of DWMend.)
@@ -118,12 +123,30 @@ pub fn start(table: HotkeyTable) -> Result<Receiver<HotkeyMatch>> {
         return Err(eyre!("keyboard::start called more than once"));
     }
 
+    spawn_thread(table)?;
+    Ok(rx)
+}
+
+/// Whether the listener thread is currently running. Used by the daemon's
+/// supervisor to decide whether [`restart`] is needed.
+pub fn is_alive() -> bool {
+    LISTENER_ALIVE.load(Ordering::SeqCst)
+}
+
+fn spawn_thread(table: HotkeyTable) -> Result<()> {
+    // Set ALIVE before spawn to close the race where a supervisor tick
+    // sees `false` between our spawn call and the new thread reaching its
+    // RAII guard. The thread will set it again on entry; the guard clears
+    // it on exit. If `spawn` itself fails we restore `false` here.
+    LISTENER_ALIVE.store(true, Ordering::SeqCst);
     std::thread::Builder::new()
         .name("dwmend-hotkeys".into())
         .spawn(move || run_listener_thread(table))
-        .map_err(|e| eyre!("failed to spawn dwmend-hotkeys thread: {e}"))?;
-
-    Ok(rx)
+        .map_err(|e| {
+            LISTENER_ALIVE.store(false, Ordering::SeqCst);
+            eyre!("failed to spawn dwmend-hotkeys thread: {e}")
+        })?;
+    Ok(())
 }
 
 /// Cooperative shutdown — post WM_QUIT to the hotkey thread.
@@ -193,6 +216,20 @@ pub fn restart(table: HotkeyTable) -> Result<()> {
 // ---- listener thread --------------------------------------------------------
 
 fn run_listener_thread(table: HotkeyTable) {
+    // RAII guard: clears LISTENER_ALIVE / LISTENER_TID on any exit path,
+    // including panics. The supervisor in daemon.rs polls `is_alive()`
+    // and calls `restart()` when this flips to false, so a clean teardown
+    // signal here is the supervisor's only fault-detection input.
+    struct AliveGuard;
+    impl Drop for AliveGuard {
+        fn drop(&mut self) {
+            LISTENER_TID.store(0, Ordering::SeqCst);
+            LISTENER_ALIVE.store(false, Ordering::SeqCst);
+        }
+    }
+    let _alive = AliveGuard;
+    LISTENER_ALIVE.store(true, Ordering::SeqCst);
+
     // SAFETY: GetCurrentThreadId is always safe.
     let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } as isize;
     LISTENER_TID.store(tid, Ordering::SeqCst);

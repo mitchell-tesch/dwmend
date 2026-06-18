@@ -17,6 +17,7 @@
 use crate::Result;
 use color_eyre::eyre::eyre;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -34,22 +35,65 @@ pub enum DisplayEvent {
 
 static EVENT_TX: std::sync::OnceLock<Sender<DisplayEvent>> = std::sync::OnceLock::new();
 
+/// `true` while the listener thread is running. Set on thread entry and
+/// cleared by an RAII guard on exit (including panic). Polled by the
+/// daemon's supervisor tick to detect silent thread death.
+static LISTENER_ALIVE: AtomicBool = AtomicBool::new(false);
+
 /// Spawn the listener thread. Returns a receiver of `DisplayEvent`s.
 pub fn start() -> Result<Receiver<DisplayEvent>> {
     let (tx, rx) = unbounded();
     if EVENT_TX.set(tx).is_err() {
-        return Ok(rx);
+        return Err(eyre!("display_change::start called more than once"));
     }
 
-    std::thread::Builder::new()
-        .name("dwmend-display".into())
-        .spawn(run_thread)
-        .map_err(|e| eyre!("failed to spawn dwmend-display thread: {e}"))?;
-
+    spawn_thread()?;
     Ok(rx)
 }
 
+/// Whether the listener thread is currently running. Used by the daemon's
+/// supervisor to decide whether [`restart`] is needed.
+pub fn is_alive() -> bool {
+    LISTENER_ALIVE.load(Ordering::SeqCst)
+}
+
+/// Respawn the listener thread on the existing channel. Intended for the
+/// daemon's watchdog after observing [`is_alive`] return `false`.
+pub fn restart() -> Result<()> {
+    if EVENT_TX.get().is_none() {
+        return Err(eyre!("display_change::restart called before start"));
+    }
+    if LISTENER_ALIVE.load(Ordering::SeqCst) {
+        return Err(eyre!(
+            "display listener still alive; refusing to restart"
+        ));
+    }
+    spawn_thread()
+}
+
+fn spawn_thread() -> Result<()> {
+    LISTENER_ALIVE.store(true, Ordering::SeqCst);
+    std::thread::Builder::new()
+        .name("dwmend-display".into())
+        .spawn(run_thread)
+        .map_err(|e| {
+            LISTENER_ALIVE.store(false, Ordering::SeqCst);
+            eyre!("failed to spawn dwmend-display thread: {e}")
+        })?;
+    Ok(())
+}
+
 fn run_thread() {
+    // RAII guard: clears LISTENER_ALIVE on any exit path including panic.
+    struct AliveGuard;
+    impl Drop for AliveGuard {
+        fn drop(&mut self) {
+            LISTENER_ALIVE.store(false, Ordering::SeqCst);
+        }
+    }
+    let _alive = AliveGuard;
+    LISTENER_ALIVE.store(true, Ordering::SeqCst);
+
     let class_name = utf16(b"DwmendDisplayListener\0");
 
     // SAFETY: GetModuleHandleW(None) always returns the current EXE.

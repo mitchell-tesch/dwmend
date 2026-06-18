@@ -259,6 +259,21 @@ pub fn run_daemon() -> Result<()> {
     let mut last_saved_ids: Vec<isize> = wm.windows.keys().map(|w| w.0).collect();
     last_saved_ids.sort_unstable();
 
+    // Background writer that owns the snapshot disk path. The daemon
+    // submits id-lists and never blocks on `std::fs::write`/`rename`,
+    // so a stalled OneDrive sync or AV scan can no longer freeze the
+    // event loop. Failure to spawn is non-fatal: we fall back to a
+    // synchronous write inside the loop, matching pre-supervision
+    // behaviour, with a warning so the user sees the regression.
+    let recovery_writer = match recovery::Writer::start() {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "recovery writer thread failed to spawn; falling back to sync writes");
+            None
+        }
+    };
+
     let wm = Arc::new(Mutex::new(wm));
 
     // Push the initial bar state so workspace pills appear at startup.
@@ -290,6 +305,15 @@ pub fn run_daemon() -> Result<()> {
     let mut last_alive = std::time::Instant::now();
     let mut event_count: u64 = 0;
     let alive_tick = crossbeam_channel::tick(Duration::from_secs(10));
+    // Listener watchdog: every 2 s, poll each platform listener's
+    // `is_alive()` flag and respawn dead ones with exponential backoff.
+    // Closes the audit's "zombie WM" gap where a panic in any of the
+    // three listener threads previously left the daemon running but
+    // unresponsive to events / keys / display changes.
+    let supervisor_tick = crossbeam_channel::tick(Duration::from_secs(2));
+    let mut winevent_health = ListenerHealth::new("winevent");
+    let mut keyboard_health = ListenerHealth::new("hotkey");
+    let mut display_health = ListenerHealth::new("display");
     loop {
         select! {
             recv(alive_tick) -> _ => {
@@ -302,6 +326,28 @@ pub fn run_daemon() -> Result<()> {
                     "select! loop alive"
                 );
                 last_alive = std::time::Instant::now();
+            }
+            recv(supervisor_tick) -> _ => {
+                // Poll each listener's alive flag and attempt restart on
+                // dead ones. The keyboard restart needs the current
+                // `router.table` (which the config-reload arm may have
+                // replaced since startup), so we capture it freshly each
+                // tick rather than threading a clone through.
+                supervise(
+                    &mut winevent_health,
+                    dwmend_platform::winevent::is_alive(),
+                    dwmend_platform::winevent::restart,
+                );
+                supervise(
+                    &mut keyboard_health,
+                    dwmend_platform::keyboard::is_alive(),
+                    || dwmend_platform::keyboard::restart(router.table.clone()),
+                );
+                supervise(
+                    &mut display_health,
+                    dwmend_platform::display_change::is_alive(),
+                    dwmend_platform::display_change::restart,
+                );
             }
             recv(winevent_rx) -> ev => {
                 let Ok(ev) = ev else { break };
@@ -553,8 +599,19 @@ pub fn run_daemon() -> Result<()> {
                 g.windows.keys().map(|w| w.0).collect()
             };
             ids.sort_unstable();
-            if ids != last_saved_ids && recovery::save_ids(&ids).is_ok() {
-                last_saved_ids = ids;
+            if ids != last_saved_ids {
+                // Hand off to the dedicated writer thread so the disk
+                // path is fully off the event loop. The fallback (sync
+                // write) is only reached if Writer::start failed at
+                // boot \u2014 in that case we accept the legacy stall risk
+                // rather than losing the snapshot entirely.
+                let queued = match recovery_writer.as_ref() {
+                    Some(w) => w.submit(ids.clone()),
+                    None => recovery::save_ids(&ids).is_ok(),
+                };
+                if queued {
+                    last_saved_ids = ids;
+                }
             }
             last_save = std::time::Instant::now();
         }
@@ -574,6 +631,13 @@ pub fn run_daemon() -> Result<()> {
     ui::tray::stop();
     dwmend_platform::keyboard::stop();
     dwmend_platform::winevent::stop();
+    // Drain any in-flight snapshot write before we delete the file
+    // below \u2014 otherwise the worker could race `clear()` and recreate
+    // hwnds.json after we've removed it, leaving a stale snapshot for
+    // the next startup to interpret as crash-recovery state.
+    if let Some(mut w) = recovery_writer {
+        w.shutdown();
+    }
     let _ = recovery::clear();
     tracing::info!("DWMend exited cleanly");
     Ok(())
@@ -745,4 +809,112 @@ fn build_toast_specs(
             }
         })
         .collect()
+}
+
+/// Per-listener watchdog state used by the supervisor tick.
+///
+/// A "listener" here is any background thread the daemon depends on for
+/// input (winevent, keyboard, display_change). When the platform-level
+/// `is_alive()` flips to false the supervisor calls `restart()` with
+/// exponential backoff and surfaces a one-shot toast on persistent
+/// failure. Without this, a panic or init failure inside a listener
+/// thread would leave the daemon "alive but blind" \u2014 the audit's
+/// most-cited Tier-1 risk.
+struct ListenerHealth {
+    name: &'static str,
+    failures: u32,
+    last_attempt: std::time::Instant,
+    was_alive: bool,
+    toasted: bool,
+}
+
+impl ListenerHealth {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            failures: 0,
+            // Set well in the past so the first restart attempt fires
+            // immediately on first detection rather than waiting for the
+            // initial backoff window to elapse.
+            last_attempt: std::time::Instant::now() - std::time::Duration::from_secs(60),
+            was_alive: true,
+            toasted: false,
+        }
+    }
+
+    /// Backoff before the next restart attempt: 1, 2, 4, 8, 16, 30 s (cap).
+    fn backoff(&self) -> std::time::Duration {
+        let secs = match self.failures {
+            0..=5 => 1u64 << self.failures,
+            _ => 30,
+        };
+        std::time::Duration::from_secs(secs.min(30))
+    }
+}
+
+/// Run one supervisor tick for a single listener. Either declares recovery
+/// (and resets the counter), or attempts restart with backoff. The
+/// `try_restart` closure is the listener-specific spawn entry point
+/// (e.g. `dwmend_platform::winevent::restart`), kept as a closure so the
+/// keyboard variant can capture the current `HotkeyTable`.
+fn supervise<F: FnMut() -> Result<()>>(
+    health: &mut ListenerHealth,
+    is_alive: bool,
+    mut try_restart: F,
+) {
+    if is_alive {
+        if !health.was_alive || health.failures > 0 {
+            tracing::info!(
+                listener = health.name,
+                attempts = health.failures,
+                "listener recovered"
+            );
+            ui::toast::show(
+                ui::toast::ToastLevel::Info,
+                format!("{} listener recovered", health.name),
+            );
+            health.failures = 0;
+            health.toasted = false;
+        }
+        health.was_alive = true;
+        return;
+    }
+
+    let now = std::time::Instant::now();
+    if health.was_alive {
+        // First tick after death: log the transition before any retry.
+        tracing::error!(listener = health.name, "listener thread died");
+        health.was_alive = false;
+    }
+
+    if now.duration_since(health.last_attempt) < health.backoff() {
+        return;
+    }
+
+    health.last_attempt = now;
+    health.failures += 1;
+    match try_restart() {
+        Ok(()) => tracing::info!(
+            listener = health.name,
+            attempt = health.failures,
+            "attempting listener restart"
+        ),
+        Err(e) => tracing::error!(
+            listener = health.name,
+            attempt = health.failures,
+            error = %e,
+            "listener restart failed"
+        ),
+    }
+
+    // One-shot toast on persistent failure. Three failures at the
+    // 1/2/4-second cadence is ~7 s of dead listener \u2014 long enough that
+    // the user has noticed, short enough to be actionable.
+    if health.failures == 3 && !health.toasted {
+        health.toasted = true;
+        ui::toast::show(
+            ui::toast::ToastLevel::Error,
+            format!("{} listener cannot recover", health.name),
+        );
+    }
 }

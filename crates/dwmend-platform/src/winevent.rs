@@ -13,7 +13,7 @@ use crate::Result;
 use color_eyre::eyre::eyre;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -68,25 +68,61 @@ static LISTENER_TID: AtomicIsize = AtomicIsize::new(0);
 /// Registered hook handle; used by `stop()` to unhook.
 static HOOK: AtomicIsize = AtomicIsize::new(0);
 
+/// `true` while the listener thread is running. Set on thread entry and
+/// cleared by an RAII guard on exit (including panic). Polled by the
+/// daemon's supervisor tick to detect silent thread death.
+static LISTENER_ALIVE: AtomicBool = AtomicBool::new(false);
+
 // ---- public API -------------------------------------------------------------
 
 /// Spawn the WinEvent listener thread. Safe to call only once per process —
-/// subsequent calls return the existing receiver.
+/// subsequent calls return an error.
 pub fn start() -> Result<Receiver<WinEvent>> {
     let (tx, rx) = unbounded();
 
-    // First caller wins; later callers just get a fresh receiver bound to the
-    // original sender (whose channel is `unbounded` so it can fan out via clone).
-    if EVENT_TX.set(tx.clone()).is_err() {
-        return Ok(rx);
+    if EVENT_TX.set(tx).is_err() {
+        return Err(eyre!("winevent::start called more than once"));
     }
 
+    spawn_thread()?;
+    Ok(rx)
+}
+
+/// Whether the listener thread is currently running. Used by the daemon's
+/// supervisor to decide whether [`restart`] is needed.
+pub fn is_alive() -> bool {
+    LISTENER_ALIVE.load(Ordering::SeqCst)
+}
+
+/// Respawn the listener thread on the existing channel. Intended for the
+/// daemon's watchdog after observing [`is_alive`] return `false`. Errors if
+/// `start` was never called or if the thread is still alive.
+pub fn restart() -> Result<()> {
+    if EVENT_TX.get().is_none() {
+        return Err(eyre!("winevent::restart called before start"));
+    }
+    if LISTENER_ALIVE.load(Ordering::SeqCst) {
+        return Err(eyre!(
+            "winevent listener still alive; refusing to restart"
+        ));
+    }
+    spawn_thread()
+}
+
+fn spawn_thread() -> Result<()> {
+    // Set ALIVE before spawn to close the race where a supervisor tick
+    // sees `false` between our spawn call and the new thread reaching its
+    // RAII guard. The thread will set it again on entry; the guard clears
+    // it on exit. If `spawn` itself fails we restore `false` here.
+    LISTENER_ALIVE.store(true, Ordering::SeqCst);
     std::thread::Builder::new()
         .name("dwmend-winevent".into())
         .spawn(run_listener_thread)
-        .map_err(|e| eyre!("failed to spawn dwmend-winevent thread: {e}"))?;
-
-    Ok(rx)
+        .map_err(|e| {
+            LISTENER_ALIVE.store(false, Ordering::SeqCst);
+            eyre!("failed to spawn dwmend-winevent thread: {e}")
+        })?;
+    Ok(())
 }
 
 /// Cooperatively stop the listener. Sends WM_QUIT to the listener thread,
@@ -111,6 +147,28 @@ pub fn stop() {
 // ---- listener thread --------------------------------------------------------
 
 fn run_listener_thread() {
+    // RAII guard: clears LISTENER_ALIVE (and TID/HOOK if still set) on any
+    // exit path, including panics. The supervisor in daemon.rs polls
+    // `is_alive()` and respawns when this flips to false, so a clean
+    // teardown signal here is the supervisor's only fault-detection input.
+    struct AliveGuard;
+    impl Drop for AliveGuard {
+        fn drop(&mut self) {
+            // Best-effort unhook in case we panicked mid-pump.
+            let h = HOOK.swap(0, Ordering::SeqCst);
+            if h != 0 {
+                // SAFETY: handle was produced by a successful
+                // SetWinEventHook earlier; UnhookWinEvent on a stale handle
+                // is documented as a no-op returning FALSE.
+                let _ = unsafe { UnhookWinEvent(HWINEVENTHOOK(h as *mut _)) };
+            }
+            LISTENER_TID.store(0, Ordering::SeqCst);
+            LISTENER_ALIVE.store(false, Ordering::SeqCst);
+        }
+    }
+    let _alive = AliveGuard;
+    LISTENER_ALIVE.store(true, Ordering::SeqCst);
+
     // Record our thread ID so `stop()` can find us.
     // SAFETY: GetCurrentThreadId is always safe.
     let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } as isize;
@@ -158,7 +216,8 @@ fn run_listener_thread() {
         }
     }
 
-    // Cleanup.
+    // Normal cleanup. The AliveGuard handles the panic path; doing it
+    // here too keeps the unhook eager when the message loop exits cleanly.
     // SAFETY: hook is valid (we stored it after a successful registration).
     let _ = unsafe { UnhookWinEvent(HWINEVENTHOOK(hook.0)) };
     HOOK.store(0, Ordering::SeqCst);
