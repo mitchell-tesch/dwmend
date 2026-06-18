@@ -82,6 +82,39 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 target\release\dwmend.exe).Hash.ToLower()
           "$hash *dwmend.exe" | Out-File -Encoding ASCII -NoNewline target\release\dwmend.exe.sha256
 
+      # ---- MSI installer build ------------------------------------------
+      #
+      # Produces a per-user installer (`%LOCALAPPDATA%\Programs\dwmend`,
+      # no UAC prompt) authored in `crates/dwmend/wix/main.wxs`. The MSI
+      # is attached to the GitHub Release alongside the portable .exe so
+      # users can pick whichever distribution model fits.
+
+      - name: Install WiX Toolset v3.14
+        shell: pwsh
+        run: |
+          choco install wixtoolset --version=3.14.1 -y --no-progress
+          # Add WiX bin to PATH for the rest of the job. cargo-wix shells
+          # out to `candle.exe` and `light.exe`, so they need to be on PATH.
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+
+      - name: Install cargo-wix
+        # `--locked` keeps the install reproducible; the rust-cache step
+        # above also caches `~/.cargo/bin` so this is a no-op on subsequent
+        # release builds with the same cargo-wix version.
+        run: cargo install cargo-wix --locked
+
+      - name: Build MSI
+        # `--no-build` re-uses the release artifact produced earlier in
+        # this workflow rather than rebuilding from scratch. `--nocapture`
+        # makes WiX output visible if linking fails.
+        run: cargo wix -p dwmend --no-build --nocapture --output target\wix\dwmend.msi
+
+      - name: Compute MSI SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 target\wix\dwmend.msi).Hash.ToLower()
+          "$hash *dwmend.msi" | Out-File -Encoding ASCII -NoNewline target\wix\dwmend.msi.sha256
+
       # Stage everything we want attached to the GitHub Release in a
       # single directory so the upload step has a flat file list.
       - name: Stage release artifacts
@@ -90,6 +123,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
           Copy-Item target\release\dwmend.exe artifacts\
           Copy-Item target\release\dwmend.exe.sha256 artifacts\
+          Copy-Item target\wix\dwmend.msi artifacts\
+          Copy-Item target\wix\dwmend.msi.sha256 artifacts\
           Copy-Item assets\config.toml artifacts\dwmend.config.example.toml
 
       - name: Publish GitHub Release
@@ -98,6 +133,8 @@ jobs:
           files: |
             artifacts/dwmend.exe
             artifacts/dwmend.exe.sha256
+            artifacts/dwmend.msi
+            artifacts/dwmend.msi.sha256
             artifacts/dwmend.config.example.toml
           # Auto-populate the release body with a "what's changed"
           # section derived from PR titles since the previous tag.

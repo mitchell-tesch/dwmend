@@ -29,6 +29,28 @@ A lightweight (and opinionated) tiling window manager for Windows 11, inspired b
 - **IPC** — named-pipe server at `\\.\pipe\DwmendDaemon-v1`. Use `dwmend cmd "focus left"` from PowerShell / AutoHotKey / StreamDeck to drive the daemon, or `dwmend query state` to introspect.
 - **Crash recovery** — `dwmend.exe restore` makes any windows **DWMend** hid visible again if the daemon crashes or is force-killed.
 
+## Install
+
+Two distribution options. Both are user-mode — neither needs administrator rights.
+
+**MSI installer** (recommended for most users):
+
+1. Download `dwmend.msi` from the [latest release](https://github.com/mitchell-tesch/dwmend/releases/latest).
+2. Double-click. Installs to `%LOCALAPPDATA%\Programs\dwmend\` and adds a Start Menu shortcut. No UAC prompt; uninstalls cleanly via *Settings → Apps*.
+3. Silent install for scripts: `msiexec /i dwmend.msi /qn`.
+
+**Portable executable** (no installer):
+
+1. Download `dwmend.exe` from the [latest release](https://github.com/mitchell-tesch/dwmend/releases/latest).
+2. Drop it anywhere on disk and run it.
+
+Both artifacts ship with a matching `.sha256` for verification:
+
+```pwsh
+(Get-FileHash -Algorithm SHA256 .\dwmend.msi).Hash.ToLower()
+# compare against the contents of dwmend.msi.sha256
+```
+
 ## Build
 
 Requires:
@@ -41,6 +63,13 @@ cargo build --release
 ```
 
 The release binary at `target\release\dwmend.exe` (~3 MB).
+
+To build the MSI locally (requires the [WiX Toolset 3.14](https://wixtoolset.org/docs/wix3/) on PATH and `cargo install cargo-wix`):
+
+```pwsh
+cargo build --workspace --release
+cargo wix -p dwmend --no-build --output target\wix\dwmend.msi
+```
 
 ## Run
 

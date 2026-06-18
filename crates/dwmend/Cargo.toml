@@ -56,3 +56,16 @@ features = [
 
 [build-dependencies]
 embed-resource = { workspace = true }
+
+# cargo-wix configuration. Drives `cargo wix -p dwmend` to build the
+# per-user MSI from `wix/main.wxs`. The UpgradeCode here mirrors the
+# one baked into `main.wxs` and must NEVER change \u2014 every future
+# release must keep using it so MajorUpgrade can find and replace
+# the previous install. `path-guid` identifies the install directory
+# component; it likewise must never change. License/EULA generation
+# is disabled because we ship a hand-authored `wix/License.rtf`.
+[package.metadata.wix]
+upgrade-guid = "62710433-7EF1-4DD2-969E-C57035D4E569"
+path-guid = "9E8A1D2B-3F47-4C6A-9B5E-7C2D4F8E1A3B"
+license = false
+eula = false

@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX Toolset v3 source for the per-user DWMend MSI.
+
+  Build via:  cargo wix -p dwmend --no-build
+
+  Notes for future-me
+  ===================
+
+  * **Per-user, no-UAC install.** Selected by `Package@InstallScope="perUser"`
+    plus the `ALLUSERS=""` and `MSIINSTALLPERUSER=1` properties below.
+    Without BOTH, Windows promotes the install to per-machine and prompts
+    for elevation, which we explicitly do not want.
+
+  * **UpgradeCode is permanent.** Never change it; in-place upgrades use
+    it to find and uninstall the previous version. ProductCode is `Id="*"`
+    so it auto-regenerates per build, which is what `MajorUpgrade` needs.
+
+  * **Install path:** `%LOCALAPPDATA%\Programs\dwmend\dwmend.exe` —
+    mirrors VS Code's per-user layout convention.
+
+  * **HKCU registry KeyPath trick.** Every WiX `Component` needs exactly
+    one `KeyPath="yes"` resource. For the binary itself the file is the
+    KeyPath; for the Start Menu shortcut Component (which has no file,
+    only a `<Shortcut>` virtual entry) we use a tiny HKCU registry value
+    as the KeyPath. This is the documented, idiomatic pattern \u2014 don't
+    "simplify" it away.
+
+  * **Running-instance handling.** `util:CloseApplication` sends WM_CLOSE
+    to any `dwmend.exe` in the user session before the install replaces
+    the binary. The daemon's Ctrl-C handler treats that as a clean Quit,
+    so an in-place upgrade doesn't leave the user with a window-frozen
+    desktop.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+  <Product
+      Id="*"
+      Name="DWMend"
+      Language="1033"
+      Version="$(var.Version)"
+      Manufacturer="Mitchell Tesch"
+      UpgradeCode="62710433-7EF1-4DD2-969E-C57035D4E569">
+
+    <Package
+        InstallerVersion="500"
+        Compressed="yes"
+        InstallScope="perUser"
+        Description="DWMend tiling window manager for Windows 11"
+        Manufacturer="Mitchell Tesch" />
+
+    <!-- Per-user mode: the MSI runs entirely in user context with no
+         elevation prompt. ARPNOMODIFY hides the unused "Modify" button
+         in Add/Remove Programs since we don't ship a feature picker. -->
+    <Property Id="ALLUSERS" Secure="yes" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" Secure="yes" />
+    <Property Id="ARPNOMODIFY" Value="1" Secure="yes" />
+
+    <!-- Add/Remove Programs metadata. -->
+    <Icon Id="DwmendIcon.exe" SourceFile="..\..\assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="DwmendIcon.exe" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/mitchell-tesch/dwmend" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/mitchell-tesch/dwmend" />
+
+    <!-- Tell any running daemon to exit cleanly before the upgrade
+         overwrites its .exe. Without this the install would fail with
+         a sharing-violation error when the OS holds the binary open. -->
+    <util:CloseApplication
+        Id="StopDwmendDaemon"
+        Target="dwmend.exe"
+        CloseMessage="yes"
+        RebootPrompt="no"
+        ElevatedCloseMessage="no" />
+
+    <!-- Major upgrade: any previously installed version is uninstalled,
+         then the new one installs. Same-version upgrades are rejected
+         so a no-op `msiexec /i` doesn't surprise the user. -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="no"
+        DowngradeErrorMessage="A newer version of DWMend is already installed. Please uninstall it first." />
+
+    <!-- Single embedded CAB; smaller download than an external one. -->
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="ProgramsFolder" Name="Programs">
+          <Directory Id="INSTALLDIR" Name="dwmend" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <!-- The daemon binary. CargoTargetBinDir is set by cargo-wix to the
+         workspace's `target/release` directory. -->
+    <ComponentGroup Id="MainExe" Directory="INSTALLDIR">
+      <Component Id="DwmendExe" Guid="*">
+        <File Id="DwmendExe"
+              Source="$(var.CargoTargetBinDir)\dwmend.exe"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Start Menu shortcut, placed directly in `Programs` (no folder)
+         since this is a single-app install. -->
+    <ComponentGroup Id="StartMenu" Directory="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <Shortcut Id="DwmendStartMenuLink"
+                  Name="DWMend"
+                  Description="Tiling window manager for Windows 11"
+                  Target="[INSTALLDIR]dwmend.exe"
+                  WorkingDirectory="INSTALLDIR" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\DWMend\Shortcut"
+                       Name="installed"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Level="1" Title="DWMend" Display="expand"
+             Description="The DWMend daemon binary and Start Menu shortcut.">
+      <ComponentGroupRef Id="MainExe" />
+      <ComponentGroupRef Id="StartMenu" />
+    </Feature>
+
+    <!-- Minimal UI: license screen + install button. -->
+    <WixVariable Id="WixUILicenseRtf" Value="wix\License.rtf" />
+    <UIRef Id="WixUI_Minimal" />
+  </Product>
+</Wix>
