@@ -112,9 +112,15 @@
              ICE64 check passes (LocalAppDataFolder is system-managed
              and excluded from ICE64).
            * `<CreateFolder />` is redundant once a `<File>` is present
-             but documents intent, so we keep it. -->
+             but documents intent, so we keep it.
+           * The component `Guid` is hardcoded \u2014 NOT `Guid="*"` \u2014 because
+             the auto-guid heuristic is invalid for components that
+             carry both a file and a registry keypath (CNDL0230). The
+             value below was generated once with `[guid]::NewGuid()` and
+             must NEVER change; Windows Installer uses it to recognise
+             the same component across upgrades. -->
     <ComponentGroup Id="MainExe" Directory="INSTALLDIR">
-      <Component Id="DwmendExe" Guid="*">
+      <Component Id="DwmendExe" Guid="45FEA96D-5642-4C81-9C72-E814DAB646C0">
         <File Id="DwmendExe"
               Source="$(var.CargoTargetBinDir)\dwmend.exe"
               KeyPath="no" />
