@@ -144,7 +144,20 @@ jobs:
         # `--no-build` re-uses the release artifact produced earlier in
         # this workflow rather than rebuilding from scratch. `--nocapture`
         # makes WiX output visible if linking fails.
-        run: cargo wix -p dwmend --no-build --nocapture --output target\wix\dwmend.msi
+        #
+        # cargo-wix runs `light.exe` with its CWD set to `target\wix\`
+        # and does NOT register the wxs source directory as a binder
+        # path. So `License.rtf` and the ARP icon (referenced in
+        # `crates/dwmend/wix/main.wxs` by simple filename) have to be
+        # staged into `target\wix\` first \u2014 otherwise light bails with
+        # LGHT0103 "system cannot find the file". The same staging is
+        # documented in the README so local builds work the same way.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target\wix | Out-Null
+          Copy-Item crates\dwmend\wix\License.rtf target\wix\License.rtf -Force
+          Copy-Item assets\icon.ico              target\wix\dwmend.ico   -Force
+          cargo wix -p dwmend --no-build --nocapture --output target\wix\dwmend.msi
 
       - name: Compute MSI SHA-256
         shell: pwsh

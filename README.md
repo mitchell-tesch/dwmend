@@ -68,6 +68,14 @@ To build the MSI locally (requires the [WiX Toolset 3.14](https://wixtoolset.org
 
 ```pwsh
 cargo build --workspace --release
+
+# Stage the binder inputs into target\wix\ \u2014 cargo-wix runs light.exe
+# from there and doesn't add the wxs source dir as a binder path, so
+# License.rtf / dwmend.ico must be alongside the linker's CWD.
+New-Item -ItemType Directory -Force -Path target\wix | Out-Null
+Copy-Item crates\dwmend\wix\License.rtf target\wix\License.rtf -Force
+Copy-Item assets\icon.ico              target\wix\dwmend.ico   -Force
+
 cargo wix -p dwmend --no-build --output target\wix\dwmend.msi
 ```
 

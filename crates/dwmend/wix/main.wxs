@@ -59,11 +59,15 @@
     <Property Id="ALLUSERS" Secure="yes" />
     <Property Id="MSIINSTALLPERUSER" Value="1" Secure="yes" />
 
-    <!-- Add/Remove Programs metadata. The icon path is resolved by
-         light.exe against its binder path, which cargo-wix sets to
-         the directory containing this wxs file (`crates/dwmend/wix/`).
-         Three `..` segments climb back to the workspace root. -->
-    <Icon Id="DwmendIcon.exe" SourceFile="..\..\..\assets\icon.ico" />
+    <!-- Add/Remove Programs metadata. cargo-wix invokes `light.exe`
+         with its CWD set to `target\wix\`, and does NOT add this
+         wxs file's source directory as a binder path. So relative
+         paths in `SourceFile` / `WixVariable` must resolve from
+         `target\wix\`. The build pipeline (CI step / local helper)
+         pre-stages `License.rtf` and `dwmend.ico` into that
+         directory before invoking cargo-wix, which is why simple
+         filenames work here. -->
+    <Icon Id="DwmendIcon.exe" SourceFile="dwmend.ico" />
     <Property Id="ARPPRODUCTICON" Value="DwmendIcon.exe" />
     <Property Id="ARPHELPLINK" Value="https://github.com/mitchell-tesch/dwmend" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/mitchell-tesch/dwmend" />
@@ -131,12 +135,10 @@
       <ComponentGroupRef Id="StartMenu" />
     </Feature>
 
-    <!-- Minimal UI: license screen + install button. The path here is
-         resolved against light.exe's binder path, which cargo-wix
-         points at the directory containing this wxs file (`wix/`),
-         so just `License.rtf` is correct \u2014 NOT `wix\License.rtf`,
-         which would be searched relative to light's CWD
-         (`target\wix\`) and fail with LGHT0103. -->
+    <!-- Minimal UI: license screen + install button. The path is
+         resolved by light.exe against its CWD (`target\wix\`),
+         where the build pipeline pre-stages `License.rtf` from
+         `crates/dwmend/wix/`. See the icon comment above. -->
     <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
     <UIRef Id="WixUI_Minimal" />
   </Product>
