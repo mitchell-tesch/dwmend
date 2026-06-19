@@ -59,8 +59,11 @@
     <Property Id="ALLUSERS" Secure="yes" />
     <Property Id="MSIINSTALLPERUSER" Value="1" Secure="yes" />
 
-    <!-- Add/Remove Programs metadata. -->
-    <Icon Id="DwmendIcon.exe" SourceFile="..\..\assets\icon.ico" />
+    <!-- Add/Remove Programs metadata. The icon path is resolved by
+         light.exe against its binder path, which cargo-wix sets to
+         the directory containing this wxs file (`crates/dwmend/wix/`).
+         Three `..` segments climb back to the workspace root. -->
+    <Icon Id="DwmendIcon.exe" SourceFile="..\..\..\assets\icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="DwmendIcon.exe" />
     <Property Id="ARPHELPLINK" Value="https://github.com/mitchell-tesch/dwmend" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/mitchell-tesch/dwmend" />
@@ -128,8 +131,13 @@
       <ComponentGroupRef Id="StartMenu" />
     </Feature>
 
-    <!-- Minimal UI: license screen + install button. -->
-    <WixVariable Id="WixUILicenseRtf" Value="wix\License.rtf" />
+    <!-- Minimal UI: license screen + install button. The path here is
+         resolved against light.exe's binder path, which cargo-wix
+         points at the directory containing this wxs file (`wix/`),
+         so just `License.rtf` is correct \u2014 NOT `wix\License.rtf`,
+         which would be searched relative to light's CWD
+         (`target\wix\`) and fail with LGHT0103. -->
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
     <UIRef Id="WixUI_Minimal" />
   </Product>
 </Wix>
