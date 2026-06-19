@@ -102,17 +102,47 @@
     </Directory>
 
     <!-- The daemon binary. CargoTargetBinDir is set by cargo-wix to the
-         workspace's `target/release` directory. -->
+         workspace's `target/release` directory.
+
+         Per-user component shape:
+           * The HKCU `RegistryValue` is the `KeyPath` (ICE38).
+           * The `<File>` carries `KeyPath="no"` so it doesn't conflict.
+           * `<RemoveFolder>` entries cover both `INSTALLDIR` and the
+             custom `ProgramsFolder` parent so the per-user-directory
+             ICE64 check passes (LocalAppDataFolder is system-managed
+             and excluded from ICE64).
+           * `<CreateFolder />` is redundant once a `<File>` is present
+             but documents intent, so we keep it. -->
     <ComponentGroup Id="MainExe" Directory="INSTALLDIR">
       <Component Id="DwmendExe" Guid="*">
         <File Id="DwmendExe"
               Source="$(var.CargoTargetBinDir)\dwmend.exe"
-              KeyPath="yes" />
+              KeyPath="no" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\DWMend\Install"
+                       Name="installed"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+        <CreateFolder />
+        <RemoveFolder Id="RemoveINSTALLDIR"
+                      Directory="INSTALLDIR"
+                      On="uninstall" />
+        <RemoveFolder Id="RemoveProgramsFolder"
+                      Directory="ProgramsFolder"
+                      On="uninstall" />
       </Component>
     </ComponentGroup>
 
     <!-- Start Menu shortcut, placed directly in `Programs` (no folder)
-         since this is a single-app install. -->
+         since this is a single-app install.
+
+         The HKCU `RegistryValue` is the component's KeyPath (ICE38).
+         `RemoveFolder` for `ProgramMenuFolder` is included for
+         tidy-up parity with the main component; ICE64 does NOT
+         require it (the start-menu folder is system-managed) but it
+         documents intent. `On="uninstall"` only deletes the folder
+         if it ends up empty, so other apps' shortcuts are safe. -->
     <ComponentGroup Id="StartMenu" Directory="ProgramMenuFolder">
       <Component Id="StartMenuShortcut" Guid="*">
         <Shortcut Id="DwmendStartMenuLink"
@@ -126,6 +156,9 @@
                        Type="integer"
                        Value="1"
                        KeyPath="yes" />
+        <RemoveFolder Id="RemoveProgramMenuFolder"
+                      Directory="ProgramMenuFolder"
+                      On="uninstall" />
       </Component>
     </ComponentGroup>
 
